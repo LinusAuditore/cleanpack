@@ -91,4 +91,10 @@ i18n.py             Interface strings in four languages
 requirements.txt    Runtime dependencies
 CleanPack.spec      PyInstaller build configuration
 icon.icns           macOS app icon
+LICENSE             BSD 2-Clause license
 ```
+
+## License
+
+Copyright 2026 Xinghao Zuo. Licensed under the [BSD 2-Clause License](LICENSE)
+(SPDX: `BSD-2-Clause`). Third-party dependencies retain their respective licenses.

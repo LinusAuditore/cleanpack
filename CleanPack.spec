@@ -1,11 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""构建带应用图标和项目许可证的 macOS 应用。"""
 
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    # 让许可证随二进制产物分发，保留版权声明、许可条件及免责声明。
+    datas=[('LICENSE', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
