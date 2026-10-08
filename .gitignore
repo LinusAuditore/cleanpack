@@ -1,0 +1,41 @@
+# macOS 元数据
+.DS_Store
+._*
+__MACOSX/
+.AppleDouble/
+.LSOverride
+
+# Python 字节码、虚拟环境和工具缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+
+# PyInstaller 构建产物；保留 .spec 配置和图标源文件
+/build/
+/dist/
+
+# 本地测试目录
+/tests/
+
+# 本地 AI 助手说明
+/AGENTS.md
+/CLAUDE.md
+
+# 本地环境配置与编辑器临时文件
+.env
+.env.*
+!.env.example
+!.env.sample
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
