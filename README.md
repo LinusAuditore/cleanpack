@@ -32,6 +32,10 @@ zstd levels 20–22 enable `--ultra` and use substantially more memory. Switchin
 
 Extraction uses the system `tar` for every format except `tar.zst`, which also needs `zstd`. 7-Zip is needed for encrypted 7z archives, for 7z archives that use a compression method the system `tar` cannot read, and for a few zip archives (for example Deflate64, or encrypted items compressed with LZMA or BZip2); CleanPack says so when it happens.
 
+## Download
+
+Builds for Mac computers with Apple silicon running macOS 26 or later are attached to [GitHub Releases](https://github.com/LinusAuditore/cleanpack/releases). The app is not signed with a Developer ID or notarized, so macOS blocks it the first time you open it: go to **System Settings ▸ Privacy & Security** and click **Open Anyway**. Formats other than `tar`, `tar.gz`, and `zip` still need the command-line tools described below.
+
 ## Run from source
 
 Requires macOS, Python 3.10 or later, and PySide6. The tools included with macOS support `tar`, `tar.gz`, and `zip`; the remaining formats require additional command-line tools.
@@ -117,10 +121,13 @@ gui_common.py       Shared Qt helpers: styles, Qt translations, localized number
 core.py             Archiving core, independent of Qt
 i18n.py             Interface strings in four languages
 requirements.txt    Runtime dependencies
+requirements-build.txt  Pinned versions for CI and release builds
 CleanPack.spec      PyInstaller build configuration
 icon.icns           macOS app icon
 LICENSE             BSD 2-Clause license
 licenses/           Third-party license texts bundled with the macOS app
+tests/              Unit tests and offscreen GUI checks
+.github/            CI and release workflows
 ```
 
 ## License

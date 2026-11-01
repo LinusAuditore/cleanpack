@@ -32,6 +32,10 @@ zstd 的 20–22 级会启用 `--ultra`，内存占用明显更高。切换格�
 
 除 `tar.zst` 还需要 `zstd` 外，所有格式都用系统 `tar` 解压。以下情况需要 7-Zip：加密的 7z 归档、使用了系统 `tar` 无法读取的压缩方法的 7z 归档，以及少数 zip 归档（例如 Deflate64，或用 LZMA、BZip2 压缩的加密项目）；遇到时 CleanPack 会说明。
 
+## 下载
+
+适用于搭载 Apple 芯片、运行 macOS 26 或更高版本的 Mac 的构建，发布在 [GitHub Releases](https://github.com/LinusAuditore/cleanpack/releases)。应用没有 Developer ID 签名，也没有经过公证，所以第一次打开时会被 macOS 拦下：请前往「系统设置 ▸ 隐私与安全性」，点按「仍要打开」。除 `tar`、`tar.gz` 和 `zip` 外，其他格式仍然需要安装下文所述的命令行工具。
+
 ## 从源码运行
 
 需要 macOS、Python 3.10 或更高版本，以及 PySide6。macOS 自带的工具支持 `tar`、`tar.gz` 和 `zip`；其余格式需要额外的命令行工具。
@@ -117,10 +121,13 @@ gui_common.py       共用的 Qt 辅助：样式、Qt 翻译、本地化数字�
 core.py             压缩核心，独立于 Qt
 i18n.py             四种语言的界面文字
 requirements.txt    运行依赖
+requirements-build.txt  CI 与发布构建使用的固定版本
 CleanPack.spec      PyInstaller 构建配置
 icon.icns           macOS 应用图标
 LICENSE             BSD 2-Clause 许可证
 licenses/           随 macOS 应用分发的第三方许可证文本
+tests/              单元测试与离屏 GUI 检查
+.github/            CI 与发布工作流
 ```
 
 ## 许可证

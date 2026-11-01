@@ -1,0 +1,87 @@
+# 在 macOS 上跑单元测试和离屏 GUI 夹具，再用 PyInstaller 构建并检查应用。
+# 发布工作流（release.yml）也通过 workflow_call 复用这里的步骤。
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["README.md", "docs/**"]
+  pull_request:
+    paths-ignore: ["README.md", "docs/**"]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    # PySide6 6.12 的二进制要求 macOS 26，构建出的应用也只能在 macOS 26 及更新的系统上运行。
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      # 测试会用到全部压缩工具；运行器预装的 7z 是旧的 p7zip，这里装 Homebrew 的 7zz。
+      - name: Install compression tools
+        run: brew install xz zstd sevenzip
+
+      # 默认 shell 带 pipefail，用 sed 读完输出，不用 head（提前关闭管道会让上游收到 SIGPIPE）。
+      - name: Show tool versions
+        run: |
+          sw_vers
+          python --version
+          /usr/bin/tar --version
+          zstd --version
+          xz --version | sed -n 1p
+          7zz | sed -n 2p
+          zip -v | sed -n 2p
+
+      - name: Unit tests
+        run: python -B -m unittest discover -s tests -v
+
+      - name: Offscreen GUI fixtures
+        run: |
+          for f in tests/gui/gui_stage4_check.py tests/gui/gui_stage5_check.py \
+                   tests/gui/gui_stage6_check.py tests/gui/gui_stage6b_check.py; do
+            echo "::group::$f"
+            python -B "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Build the app
+        run: python -B -m PyInstaller --clean --noconfirm CleanPack.spec
+
+      - name: Check the app bundle
+        run: .github/scripts/check_app.sh dist/CleanPack.app
+
+      # 用 ditto 打包，保留 .app 里的符号链接和权限；直接上传目录会丢失它们。
+      - name: Package the app
+        run: |
+          version="$(python -B -c 'import core; print(core.APP_VERSION)')"
+          ditto -c -k --keepParent dist/CleanPack.app "dist/CleanPack-$version-macos-arm64.zip"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: CleanPack-macos-arm64
+          path: dist/CleanPack-*-macos-arm64.zip
+          if-no-files-found: error

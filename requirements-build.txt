@@ -1,0 +1,3 @@
+# CI 和发布构建使用的固定版本，与本机验证过的构建一致；日常运行只需要 requirements.txt。
+PySide6==6.12.0
+pyinstaller==6.22.3
