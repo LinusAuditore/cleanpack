@@ -1,5 +1,7 @@
 # CleanPack
 
+English | [简体中文](docs/README_zh.md)
+
 **Create and extract clean archives on macOS, automatically excluding system files such as `.DS_Store`, `._*`, and `__MACOSX`.**
 
 CleanPack is a desktop archiving tool built with Python and PySide6. Select or drag in a file or folder, choose an archive format and compression level, and create an archive ready to share without writing exclusion commands. In Extract mode, it unpacks archives from others and leaves their macOS junk behind. This project was developed with assistance from OpenAI Codex.
