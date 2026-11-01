@@ -28,6 +28,8 @@ htmlcov/
 # 本地 AI 助手说明
 /AGENTS.md
 /CLAUDE.md
+/PROGRESS.md
+/COMMIT_HISTORY.md
 
 # 本地环境配置与编辑器临时文件
 .env
