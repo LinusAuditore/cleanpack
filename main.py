@@ -1,24 +1,24 @@
 """CleanPack GUI（PySide6）。运行：python3 main.py"""
 from __future__ import annotations
 
-import codecs
 import sys
 import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QLocale, QObject, QProcess, QSettings, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import (QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent,
-                           QGuiApplication)
+from PySide6.QtCore import QLocale, QObject, QProcess, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QGuiApplication
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QMessageBox, QPlainTextEdit,
+                               QMenuBar, QMessageBox, QPlainTextEdit,
                                QProgressBar, QPushButton, QSlider, QVBoxLayout,
                                QWidget)
 
 import core
-from gui_common import confirm, format_secs, format_size, process_environment
+from gui_common import (NOTE_STYLE, WARN_STYLE, PathInput, confirm, format_secs,
+                        format_size, install_qt_translator, process_environment)
 from i18n import LANGS, current_lang, detect_lang, set_lang, tr
+from tools_dialog import ToolchainController, ToolsDialog, brew_notice
 
 # 首次启动时的默认格式：只用 macOS 自带工具即可完成，不会一打开就提示缺少工具。
 DEFAULT_FORMAT = "zip"
@@ -31,7 +31,7 @@ class Bridge(QObject):
 
 
 class MainWindow(QWidget):
-    """管理输入、工具链和任务状态；后台结果仅通过 Bridge 更新控件。"""
+    """管理输入和任务状态；工具链由 ToolchainController 管理，后台结果仅通过 Bridge 更新控件。"""
     def __init__(self, settings: QSettings) -> None:
         """以 settings 保存语言和格式偏好，并初始化空闲任务状态。"""
         super().__init__()
@@ -41,28 +41,33 @@ class MainWindow(QWidget):
         self.out_stem: str | None = None
         self.job: core.ArchiveJob | None = None
         self._worker: threading.Thread | None = None
-        self.proc: QProcess | None = None
-        self._proc_buffer = ""
-        self._proc_decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        self._install_cancelled = False
         self._quit_requested = False
         self._quit_ready = False
         self._last_fmt: str | None = None
         self.t0 = 0.0
-        self.brew: str | None = None
-        self.tool_paths: dict[str, str | None] = {}
 
         self.bridge = Bridge()
         # 跨线程信号由 Qt 排队到主线程，工作线程不能直接修改控件。
         self.bridge.log.connect(self.append_log)
         self.bridge.done.connect(self.on_job_done)
 
+        self.tools = ToolchainController(self)
+        self.tools_dialog = ToolsDialog(self.tools, self)
+        # 工具链窗口是独立窗口，不随主窗口一起显示，也不阻止应用在关闭主窗口时退出。
+        self.tools_dialog.setWindowFlag(Qt.Window, True)
+        self.tools.changed.connect(self.refresh_busy_ui)
+        self.tools.changed.connect(self._maybe_finish_quit)
+        self.tools.status.connect(self.append_log)
+
         self.setAcceptDrops(True)
         self._build()
-        self.refresh_tools()
+        self._build_menu()
+        self.tools.refresh()
         self.on_format_changed()
         self.retranslate()
-        QTimer.singleShot(300, self.check_brew_on_start)
+        # 在终端里装好工具后切回应用，横幅应自动更新，不必打开工具链窗口。
+        QGuiApplication.instance().applicationStateChanged.connect(self.on_app_state_changed)
+        QTimer.singleShot(300, lambda: brew_notice(self, self.tools))
 
     # ---------------- 界面 ----------------
     def _build(self) -> None:
@@ -71,12 +76,12 @@ class MainWindow(QWidget):
         root.addLayout(self._build_header())
         root.addWidget(self._build_source_group())
         root.addWidget(self._build_options_group())
-        root.addWidget(self._build_tools_group())
         root.addWidget(self._build_log_group(), 1)
+        root.addLayout(self._build_banner())
         root.addLayout(self._build_actions())
 
     def _build_header(self) -> QHBoxLayout:
-        """构建标题与语言选择器，返回顶部布局。"""
+        """构建标题、语言选择器和工具链入口，返回顶部布局。"""
         top = QHBoxLayout()
         self.title_lbl = QLabel()
         f = self.title_lbl.font()
@@ -89,27 +94,40 @@ class MainWindow(QWidget):
             self.lang_combo.addItem(name, code)
         self.lang_combo.setCurrentIndex([c for c, _ in LANGS].index(current_lang()))
         self.lang_combo.currentIndexChanged.connect(self.on_lang_changed)
+        self.btn_tools = QPushButton()
+        self.btn_tools.clicked.connect(self.open_tools)
         top.addWidget(self.title_lbl)
         top.addStretch()
         top.addWidget(self.lang_lbl)
         top.addWidget(self.lang_combo)
+        top.addWidget(self.btn_tools)
         return top
 
+    def _build_menu(self) -> None:
+        """在 macOS 菜单栏加入「工具 ▸ 工具链…」；无父对象的 QMenuBar 会成为全局菜单栏。"""
+        self.menu_bar = QMenuBar(None)
+        self.tools_menu = self.menu_bar.addMenu("")
+        self.tools_action = QAction(self)
+        self.tools_action.triggered.connect(self.open_tools)
+        self.tools_menu.addAction(self.tools_action)
+
     def _build_source_group(self) -> QGroupBox:
-        """构建文件输入区，返回源文件分组。"""
+        """构建可键入的源路径框和选择按钮，校验提示显示在路径框之后，返回源文件分组。"""
         self.src_box = QGroupBox()
-        h = QHBoxLayout(self.src_box)
-        self.src_edit = QLineEdit()
-        self.src_edit.setReadOnly(True)
-        # 让拖放交给窗口统一处理，避免文本控件截获文件 URL。
-        self.src_edit.setAcceptDrops(False)
+        v = QVBoxLayout(self.src_box)
+        h = QHBoxLayout()
+        self.src_input = PathInput(self._parse_source)
+        self.src_input.committed.connect(self.on_source_committed)
+        self.src_input.checked.connect(self.update_go_state)
         self.btn_folder = QPushButton()
         self.btn_file = QPushButton()
         self.btn_folder.clicked.connect(self.choose_folder)
         self.btn_file.clicked.connect(self.choose_file)
-        h.addWidget(self.src_edit, 1)
+        h.addWidget(self.src_input, 1)
         h.addWidget(self.btn_folder)
         h.addWidget(self.btn_file)
+        v.addLayout(h)
+        v.addWidget(self.src_input.hint)
         return self.src_box
 
     def _build_options_group(self) -> QGroupBox:
@@ -143,62 +161,28 @@ class MainWindow(QWidget):
 
         self.level_note = QLabel()
         self.level_note.setWordWrap(True)
-        # 使用系统调色板，保证浅色和深色主题下的说明都有足够对比度。
-        self.level_note.setStyleSheet("color: palette(text);")
+        self.level_note.setStyleSheet(NOTE_STYLE)
         g.addWidget(self.level_note, 2, 1, 1, 4)
         self.extreme_chk = QCheckBox()
         g.addWidget(self.extreme_chk, 3, 1, 1, 4)
 
         self.out_lbl = QLabel()
-        self.out_edit = QLineEdit()
-        self.out_edit.setAcceptDrops(False)
+        self.out_input = PathInput(self._parse_output)
+        self.out_input.committed.connect(self.on_output_committed)
+        self.out_input.checked.connect(self.update_go_state)
         self.btn_save = QPushButton()
         self.btn_save.clicked.connect(self.choose_output)
         g.addWidget(self.out_lbl, 4, 0)
-        g.addWidget(self.out_edit, 4, 1, 1, 3)
+        g.addWidget(self.out_input, 4, 1, 1, 3)
         g.addWidget(self.btn_save, 4, 4)
+        g.addWidget(self.out_input.hint, 5, 1, 1, 4)
 
         self.excl_lbl = QLabel()
         self.excl_lbl.setWordWrap(True)
-        self.excl_lbl.setStyleSheet("color: palette(text);")
-        g.addWidget(self.excl_lbl, 5, 0, 1, 5)
+        self.excl_lbl.setStyleSheet(NOTE_STYLE)
+        g.addWidget(self.excl_lbl, 6, 0, 1, 5)
         g.setColumnStretch(2, 1)
         return self.opt_box
-
-    def _build_tools_group(self) -> QGroupBox:
-        """构建工具状态与安装操作，返回工具链分组。"""
-        self.tools_box = QGroupBox()
-        tv = QVBoxLayout(self.tools_box)
-        self.brew_lbl = QLabel()
-        tv.addWidget(self.brew_lbl)
-        grid = QGridLayout()
-        self.tool_rows: dict[str, tuple[QLabel, QLabel, QLabel]] = {}
-        for i, key in enumerate(core.TOOLS):
-            name, status, used, path = QLabel(f"<b>{key}</b>"), QLabel(), QLabel(), QLabel()
-            path.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            path.setStyleSheet("color: palette(text);")
-            for col, w in enumerate((name, status, used, path)):
-                grid.addWidget(w, i, col)
-            self.tool_rows[key] = (status, used, path)
-        grid.setColumnStretch(3, 1)
-        tv.addLayout(grid)
-        self.cmd_edit = QLineEdit()
-        self.cmd_edit.setReadOnly(True)
-        self.cmd_edit.setAcceptDrops(False)
-        tv.addWidget(self.cmd_edit)
-        hb = QHBoxLayout()
-        self.btn_install = QPushButton()
-        self.btn_copy = QPushButton()
-        self.btn_refresh = QPushButton()
-        self.btn_install.clicked.connect(self.install_missing)
-        self.btn_copy.clicked.connect(lambda: self.copy_text(self.cmd_edit.text()))
-        self.btn_refresh.clicked.connect(self.refresh_tools)
-        hb.addWidget(self.btn_install)
-        hb.addWidget(self.btn_copy)
-        hb.addStretch()
-        hb.addWidget(self.btn_refresh)
-        tv.addLayout(hb)
-        return self.tools_box
 
     def _build_log_group(self) -> QGroupBox:
         """构建只读日志区，返回日志分组。"""
@@ -211,36 +195,48 @@ class MainWindow(QWidget):
         lv.addWidget(self.log_view)
         return self.log_box
 
-    def _build_actions(self) -> QVBoxLayout:
-        """构建警告与任务操作区，返回底部布局。"""
-        actions = QVBoxLayout()
+    def _build_banner(self) -> QHBoxLayout:
+        """构建工具链横幅：只在当前格式缺工具或正在安装时显示，按钮打开工具链窗口。"""
+        banner = QHBoxLayout()
         self.warn_lbl = QLabel()
-        self.warn_lbl.setStyleSheet("color: palette(text); font-weight: bold;")
+        self.warn_lbl.setStyleSheet(WARN_STYLE)
         self.warn_lbl.setWordWrap(True)
-        actions.addWidget(self.warn_lbl)
+        self.banner_btn = QPushButton()
+        self.banner_btn.clicked.connect(self.open_tools)
+        banner.addWidget(self.warn_lbl, 1)
+        banner.addWidget(self.banner_btn)
+        return banner
+
+    def _build_actions(self) -> QHBoxLayout:
+        """构建进度条与任务操作按钮，返回底部布局。"""
         bottom = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setVisible(False)
         self.btn_cancel = QPushButton()
         self.btn_cancel.setEnabled(False)
-        self.btn_cancel.clicked.connect(self.cancel)
+        self.btn_cancel.clicked.connect(self.cancel_job)
         self.btn_go = QPushButton()
         self.btn_go.setDefault(True)
         self.btn_go.clicked.connect(self.start)
         bottom.addWidget(self.progress, 1)
         bottom.addWidget(self.btn_cancel)
         bottom.addWidget(self.btn_go)
-        actions.addLayout(bottom)
-        return actions
+        return bottom
 
     def retranslate(self) -> None:
         """按当前语言刷新界面，保留路径、日志和正在运行的任务。"""
         self.setWindowTitle(core.APP_NAME)
         self.title_lbl.setText(tr("title"))
         self.lang_lbl.setText(tr("language"))
+        self.btn_tools.setText(tr("tools_btn"))
+        self.tools_menu.setTitle(tr("tools_menu"))
+        self.tools_action.setText(tr("tools_btn"))
         self.src_box.setTitle(tr("source_group"))
-        self.src_edit.setPlaceholderText(tr("drop_hint"))
+        self.src_input.setPlaceholderText(tr("drop_hint"))
+        self.src_input.retranslate()
+        self.out_input.setPlaceholderText(tr("out_placeholder"))
+        self.out_input.retranslate()
         self.btn_folder.setText(tr("choose_folder"))
         self.btn_file.setText(tr("choose_file"))
         self.opt_box.setTitle(tr("options_group"))
@@ -253,23 +249,20 @@ class MainWindow(QWidget):
         self.btn_save.setText(tr("save_as"))
         junk = ", ".join(p.replace("\r", "\\r") for p in core.JUNK)
         self.excl_lbl.setText(tr("excluded", list=junk))
-        self.tools_box.setTitle(tr("tools_group"))
-        self.btn_install.setText(tr("install_btn"))
-        self.btn_copy.setText(tr("copy_cmd"))
-        self.btn_refresh.setText(tr("refresh"))
         self.log_box.setTitle(tr("log"))
         self.btn_cancel.setText(tr("cancel"))
         self.btn_go.setText(tr("compress"))
-        self.update_tool_labels()
+        self.tools_dialog.retranslate()
         self.on_level_changed()
-        self.update_go_state()
+        self.refresh_busy_ui()
 
     # ---------------- 语言 / 格式 / 级别 ----------------
     def on_lang_changed(self) -> None:
-        """保存用户选择的语言，并刷新可见标签。"""
+        """保存用户选择的语言，并刷新可见标签和 Qt 自带文案的翻译。"""
         code = self.lang_combo.currentData()
         set_lang(code)
         self.settings.setValue("lang", code)
+        install_qt_translator()
         self.retranslate()
 
     def current_format(self) -> core.Format:
@@ -294,7 +287,12 @@ class MainWindow(QWidget):
             self.level_slider.blockSignals(False)
         self.extreme_chk.setVisible(fmt.key == "tar.xz")
         self.on_level_changed()
-        self.update_output_path()
+        # macOS 上点选格式菜单不会让输出框失去焦点，先提交其中的草稿，免得被自动路径覆盖。
+        if self.out_input.pending and self.out_input.isEnabled():
+            self.out_input.commit()
+        # 草稿不合格时保留原文和提示，让用户修改；否则按新格式更新扩展名。
+        if self.out_input.error is None:
+            self.update_output_path()
         self.update_go_state()
 
     def on_level_changed(self, *_: object) -> None:
@@ -315,13 +313,23 @@ class MainWindow(QWidget):
 
     # ---------------- 源 / 输出 ----------------
     def set_source(self, path: str) -> None:
-        """接受本地文件或目录路径，并重置上一输入的输出命名偏好。"""
-        if not path:
-            return
-        self.src = Path(path)
+        """以拖放或文件对话框给出的路径提交源；空路径（对话框取消）不改变当前输入。"""
+        if path:
+            self.src_input.submit(path)
+
+    @staticmethod
+    def _parse_source(text: str) -> Path | None:
+        """校验源路径框的文字；空白返回 None，不合格时抛出 JobError。"""
+        s = core.clean_typed_path(text)
+        return core.validate_source(s) if s else None
+
+    def on_source_committed(self, path: Path | None) -> None:
+        """源提交后重置输出命名偏好；不合格或清空时没有可用的源，提示留在路径框里。"""
+        self.src = path
         self.out_dir = None
         self.out_stem = None
-        self.src_edit.setText(str(self.src))
+        if path is not None:
+            self.src_input.display(str(path))  # 显示整理后的路径，例如展开 ~ 后的结果
         self.update_output_path()
         self.update_go_state()
 
@@ -331,224 +339,168 @@ class MainWindow(QWidget):
     def choose_file(self) -> None:
         self.set_source(QFileDialog.getOpenFileName(self, tr("choose_file"))[0])
 
-    def update_output_path(self) -> None:
-        """由当前源路径、命名偏好和格式组合输出路径。"""
-        if not self.src:
-            return
+    def output_path(self) -> Path:
+        """由源路径、命名偏好和当前格式组合输出路径；调用前必须已有源。"""
+        assert self.src is not None
         d = self.out_dir or self.src.parent
         stem = self.out_stem or self.src.name
-        self.out_edit.setText(str(d / (stem + self.current_format().ext)))
+        return d / (stem + self.current_format().ext)
+
+    def update_output_path(self) -> None:
+        """在输出框显示组合出的输出路径；没有源时清空。"""
+        self.out_input.display(str(self.output_path()) if self.src else "")
+
+    def _parse_output(self, text: str) -> tuple[Path, str | None] | None:
+        """解析输出框文字：只写名称时相对当前输出目录；不合格时抛出 JobError。"""
+        current = self.out_dir or (self.src.parent if self.src else Path.home())
+        return core.parse_output(text, current)
+
+    def on_output_committed(self, result: tuple[Path, str | None] | None) -> None:
+        """把键入的输出位置写回 out_dir/out_stem，切换格式时不会丢失；留空恢复默认。"""
+        if self.out_input.error is not None:
+            return  # 保留之前的设置，错误提示留在输出框
+        if result is None:
+            self.out_dir = self.out_stem = None
+        else:
+            self.out_dir, stem = result
+            if stem is not None:
+                self.out_stem = stem
+        self.update_output_path()
+        self.update_go_state()
 
     def choose_output(self) -> None:
         """通过原生保存对话框更新输出目录和不含归档扩展名的名称。"""
+        if not self.src:
+            return
         ext = self.current_format().ext
-        p, _ = QFileDialog.getSaveFileName(self, tr("save_as"), self.out_edit.text(), f"*{ext}")
+        p, _ = QFileDialog.getSaveFileName(self, tr("save_as"), str(self.output_path()), f"*{ext}")
         if p:
             p = Path(p)
             self.out_dir, self.out_stem = p.parent, core.strip_ext(p.name)
             self.update_output_path()
+            self.update_go_state()
 
     def dragEnterEvent(self, e: QDragEnterEvent) -> None:
         """仅接受空闲时拖入的一个本地路径，避免静默遗漏多选项目。"""
         urls = e.mimeData().urls()
-        if (len(urls) == 1 and urls[0].isLocalFile()
-                and self.job is None and self.proc is None):
+        if len(urls) == 1 and urls[0].isLocalFile() and not self.is_busy():
             e.acceptProposedAction()
 
     def dropEvent(self, e: QDropEvent) -> None:
         """把有效拖放转为源路径选择，安装或压缩期间保持输入不变。"""
         urls = e.mimeData().urls()
-        if (len(urls) == 1 and urls[0].isLocalFile()
-                and self.job is None and self.proc is None):
+        if len(urls) == 1 and urls[0].isLocalFile() and not self.is_busy():
             self.set_source(urls[0].toLocalFile())
             e.acceptProposedAction()
 
     # ---------------- 工具链 ----------------
-    def refresh_tools(self) -> None:
-        """重新检测 Homebrew 和工具路径，并刷新任务可用状态。"""
-        self.brew = core.find_brew()
-        self.tool_paths = {k: core.locate(k) for k in core.TOOLS}
-        self.update_tool_labels()
-        self.update_go_state()
+    def open_tools(self) -> None:
+        self.tools_dialog.show_and_raise()
 
-    def update_tool_labels(self) -> None:
-        """根据缓存的工具路径更新安装提示；运行任务时禁用安装按钮。"""
-        self.brew_lbl.setText(tr("brew_ok", path=self.brew) if self.brew else tr("brew_missing"))
-        for key, (status, used, path_lbl) in self.tool_rows.items():
-            tool, p = core.TOOLS[key], self.tool_paths.get(key)
-            text = f"✅ {tr('tool_ok')}" if p else f"❌ {tr('tool_missing')}"
-            # 按实际路径判断是否系统自带：PATH 中 Homebrew 目录在前时可能找到 Homebrew 的版本。
-            if p and core.is_system_path(p):
-                text += f" ({tr('system_tool')})"
-            status.setText(text)
-            used.setText(tr("used_by", fmts=", ".join(core.formats_using(key))))
-            if p:
-                path_lbl.setText(p)
-            elif tool.formula:
-                path_lbl.setText(f"brew install {tool.formula}")
-            else:
-                path_lbl.setText(tr("tools_not_brew", tools=key))
-        formulas = core.missing_formulas(self.tool_paths)
-        # 没有 formula 的工具（例如 tar）缺失时无法安装，不能显示“所有工具均已安装”。
-        unfixable = [k for k, p in self.tool_paths.items() if not p and not core.TOOLS[k].formula]
-        if formulas:
-            self.cmd_edit.setText("brew install " + " ".join(formulas))
-        elif unfixable:
-            self.cmd_edit.setText(tr("tools_not_brew", tools=", ".join(unfixable)))
+    def on_app_state_changed(self, state: Qt.ApplicationState) -> None:
+        """应用重新激活时重新检测工具和路径；安装进行中由安装结束时统一刷新工具。
+
+        用户可能在 Finder 或终端里新建了输出文件夹、删除了源，切回应用后提示应随之更新。
+        """
+        if state != Qt.ApplicationActive:
+            return
+        if not self.tools.installing:
+            self.tools.refresh()
+        if not self.is_busy():
+            self.src_input.recheck()  # 发出 checked，随后刷新按钮和输出提示
+
+    def update_banner(self) -> None:
+        """只在当前格式缺工具或正在安装时显示横幅；文案不写位置，按钮直接打开工具链窗口。"""
+        fmt = self.current_format().key
+        missing = self.tools.missing_for(fmt)
+        if self.tools.installing:
+            text, button = tr("installing_banner"), tr("tools_btn")
+        elif missing and not any(core.TOOLS[t].formula for t in missing):
+            # 缺的都是 macOS 自带、无法用 Homebrew 安装的工具，不能提示去安装。
+            text, button = tr("tools_not_brew", tools=", ".join(missing)), tr("tools_btn")
+        elif missing:
+            # 没有 Homebrew 时无法在应用内安装，按钮只打开工具链窗口，不承诺“安装”。
+            button = tr("tools_fix_btn") if self.tools.brew else tr("tools_btn")
+            text = tr("missing_tools", fmt=fmt, tools=", ".join(missing))
         else:
-            self.cmd_edit.setText(tr("nothing_missing"))
-        busy = self.job is not None or self.proc is not None
-        self.btn_install.setEnabled(bool(formulas and self.brew) and not busy)
-        self.btn_copy.setEnabled(bool(formulas))
-
-    def install_missing(self) -> None:
-        """用异步 QProcess 安装缺失 formula，并把合并输出交给日志槽。"""
-        formulas = core.missing_formulas(self.tool_paths)
-        if not (formulas and self.brew):
-            return
-        self.proc = QProcess(self)
-        env = process_environment()
-        env.insert("NONINTERACTIVE", "1")
-        env.insert("HOMEBREW_NO_ENV_HINTS", "1")
-        self.proc.setProcessEnvironment(env)
-        self.proc.setProcessChannelMode(QProcess.MergedChannels)
-        self.proc.readyReadStandardOutput.connect(self._read_proc)
-        self.proc.finished.connect(self._install_finished)
-        self.proc.errorOccurred.connect(self._install_error)
-        self._proc_buffer = ""
-        self._proc_decoder.reset()
-        self._install_cancelled = False
-        self.append_log(tr("installing", cmd="brew install " + " ".join(formulas)))
-        self.set_busy(True)
-        self.proc.start(self.brew, ["install", *formulas])
-
-    def _read_proc(self) -> None:
-        """增量解码并缓存未换行输出，避免分批到达的 UTF-8 字符和日志被拆坏。"""
-        if self.proc is None:
-            return
-        self._proc_buffer += self._proc_decoder.decode(bytes(self.proc.readAllStandardOutput()))
-        lines = self._proc_buffer.split("\n")
-        self._proc_buffer = lines.pop()
-        for line in lines:
-            if line.strip():
-                self.append_log(line.rstrip())
-
-    def _install_error(self, error: QProcess.ProcessError) -> None:
-        """处理不会触发 finished 信号的启动失败，恢复空闲界面。"""
-        if error == QProcess.FailedToStart and self.proc is not None:
-            self.append_log(tr("install_start_fail", err=self.proc.errorString()))
-            self._finish_install()
-            self._maybe_finish_quit()
-
-    def _install_finished(self, code: int, status: QProcess.ExitStatus) -> None:
-        """记录安装结果并统一释放进程；用户取消和意外中止分别说明，不当作普通失败。"""
-        self._finish_install()
-        if self._install_cancelled:
-            self.append_log(tr("install_cancelled"))
-        elif status == QProcess.CrashExit:
-            self.append_log(tr("install_crashed"))
-        elif code == 0:
-            self.append_log(tr("install_ok"))
-        else:
-            self.append_log(tr("install_fail", code=code))
-        self._maybe_finish_quit()
-
-    def _finish_install(self) -> None:
-        """排空剩余日志、释放 QProcess，然后恢复按钮并重新检测工具。"""
-        if self.proc is None:
-            return
-        self._read_proc()
-        self._proc_buffer += self._proc_decoder.decode(b"", final=True)
-        if self._proc_buffer.strip():
-            self.append_log(self._proc_buffer.rstrip())
-        self._proc_buffer = ""
-        self.proc.deleteLater()
-        self.proc = None
-        self.set_busy(False)
-        self.refresh_tools()
-
-    def _cancel_install(self) -> None:
-        """先请求 brew 正常退出以便它自行清理，5 秒后仍在运行再强制终止。"""
-        proc = self.proc
-        if proc is None:
-            return
-        self._install_cancelled = True
-        proc.terminate()
-        QTimer.singleShot(5000, lambda: self._kill_if_running(proc))
-
-    def _kill_if_running(self, proc: QProcess) -> None:
-        # 安装结束后 self.proc 会被清空，只有仍是当前进程时才强制终止，避免操作已释放的对象。
-        if self.proc is proc:
-            proc.kill()
-
-    def check_brew_on_start(self) -> None:
-        """缺少 Homebrew 时提供官网和安装命令，不自动执行安装脚本。"""
-        if self.brew:
-            return
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle(tr("brew_dlg_title"))
-        box.setText(tr("brew_dlg_title"))
-        box.setInformativeText(tr("brew_dlg_text") + "\n\n" + core.BREW_INSTALL_CMD)
-        b_site = box.addButton(tr("open_site"), QMessageBox.ActionRole)
-        b_copy = box.addButton(tr("copy_install"), QMessageBox.ActionRole)
-        box.addButton(tr("continue"), QMessageBox.AcceptRole)
-        box.exec()
-        if box.clickedButton() is b_site:
-            QDesktopServices.openUrl(QUrl("https://brew.sh"))
-        elif box.clickedButton() is b_copy:
-            self.copy_text(core.BREW_INSTALL_CMD)
-
-    def copy_text(self, text: str) -> None:
-        QGuiApplication.clipboard().setText(text)
-        self.append_log(tr("copied"))
+            text, button = "", ""
+        self.warn_lbl.setText(text)
+        self.banner_btn.setText(button)
+        self.warn_lbl.setVisible(bool(text))
+        self.banner_btn.setVisible(bool(text))
 
     # ---------------- 压缩 ----------------
     def is_busy(self) -> bool:
-        return self.job is not None or self.proc is not None
+        return self.job is not None or self.tools.installing
 
     def update_go_state(self) -> None:
-        """根据输入、工具缺失和忙碌状态决定压缩按钮、输出控件及警告内容。"""
+        """根据输入、输出预检、工具缺失和忙碌状态决定压缩按钮、输出控件及横幅内容。"""
         busy = self.is_busy()
-        missing = core.missing_tools(self.current_format().key, self.tool_paths)
-        if missing and not any(core.TOOLS[t].formula for t in missing):
-            # 缺的都是 macOS 自带、无法用 Homebrew 安装的工具，不能再提示去工具链安装。
-            self.warn_lbl.setText(tr("tools_not_brew", tools=", ".join(missing)))
-        elif missing:
-            self.warn_lbl.setText(tr("missing_tools", fmt=self.current_format().key,
-                                     tools=", ".join(missing)))
-        else:
-            self.warn_lbl.setText("")
+        missing = self.tools.missing_for(self.current_format().key)
+        self.update_banner()
         has_src = bool(self.src)
-        self.btn_go.setEnabled(has_src and not missing and not busy)
+        if not busy:
+            self.out_input.set_note(self._output_problem())
+        if self.src_input.pending:
+            # 源草稿还没提交：校验通过即可点击，start 会先提交它。提交新源会重新生成
+            # 输出路径，旧的输出提示不再适用，由 start 完整预检。
+            src_ok = self.src_input.error is None and bool(self.src_input.text().strip())
+            out_ok = True
+        else:
+            src_ok = has_src and self.src_input.error is None
+            out_ok = self.out_input.error is None and self.out_input.note is None
+        self.btn_go.setEnabled(src_ok and out_ok and not missing and not busy)
         # 选定源之前还没有可组合的输出路径，另存为和输出框暂不可用，避免选择被静默丢弃。
         self.btn_save.setEnabled(has_src and not busy)
-        self.out_edit.setEnabled(has_src and not busy)
+        self.out_input.setEnabled(has_src and not busy)
 
-    def set_busy(self, busy: bool) -> None:
-        """根据 busy 切换进度和输入控件，结束后恢复当前格式的限制。"""
-        self.progress.setVisible(busy)
-        self.btn_cancel.setEnabled(busy)
-        for w in (self.btn_folder, self.btn_file, self.fmt_combo,
-                  self.level_slider, self.extreme_chk):
+    def _output_problem(self) -> core.JobError | None:
+        """对已提交的源和输出做压缩前预检，返回应在输出框下提示的问题。
+
+        任一路径框有草稿时不检查：已提交的位置即将被草稿替换，start 会先提交再完整预检。
+        """
+        if not self.src or self.src_input.pending or self.out_input.pending:
+            return None
+        try:
+            core.check_compress_output(self.src, self.output_path())
+        except core.JobError as exc:
+            return exc
+        except OSError as exc:
+            return core.job_error_from_os(exc)
+        return None
+
+    def refresh_busy_ui(self) -> None:
+        """按任务和安装状态切换进度、输入控件和按钮；进度条与取消按钮只对应压缩任务。"""
+        busy = self.is_busy()
+        running = self.job is not None
+        self.progress.setVisible(running)
+        self.btn_cancel.setEnabled(running)
+        for w in (self.src_input, self.btn_folder, self.btn_file, self.fmt_combo,
+                  self.extreme_chk):
             w.setEnabled(not busy)
-        if not busy:
-            self.on_format_changed_enable_only()
-        self.update_tool_labels()
+        self.level_slider.setEnabled(not busy and self.current_format().level is not None)
         self.update_go_state()
 
-    def on_format_changed_enable_only(self) -> None:
-        self.level_slider.setEnabled(self.current_format().level is not None)
-
     def start(self) -> None:
-        """预检输出位置、确认覆盖意图，捕获参数后启动后台压缩线程。"""
+        """提交键入中的路径，预检源和输出、确认覆盖意图，捕获参数后启动后台压缩线程。"""
+        # 提交新的源会重置输出命名，所以先记下输出框的草稿，源提交之后再提交它。
+        out_draft = self.out_input.text() if self.out_input.pending else None
+        self.src_input.commit()
+        if self.src_input.error is not None:
+            return  # 原因已显示在源路径框之后
         if not self.src:
             self.show_message(QMessageBox.Warning, tr("no_source"))
             return
-        out = Path(self.out_edit.text()).expanduser().absolute()
-        # 先检查输出位置，避免用户确认替换后才发现目录不可写或输出会覆盖源文件。
+        if out_draft is not None:
+            self.out_input.setText(out_draft)
+        self.out_input.commit()
+        if self.out_input.error is not None:
+            return
+        out = self.output_path()
+        # 源可能在选择之后被删除；输出位置也要先检查，避免用户确认替换后才发现目录不可写。
         try:
-            core.check_compress_output(self.src.absolute(), out)
+            core.validate_source(self.src)
+            core.check_compress_output(self.src, out)
         except (core.JobError, OSError) as exc:
             err = exc if isinstance(exc, core.JobError) else core.job_error_from_os(exc)
             self.show_message(QMessageBox.Warning, tr("failed", err=tr(err.key, **err.kw)))
@@ -564,7 +516,8 @@ class MainWindow(QWidget):
             log=self.bridge.log.emit,
         )
         self.t0 = time.monotonic()
-        self.set_busy(True)
+        # 通知控制器任务开始，工具链窗口随之停用安装按钮，保持两者互斥。
+        self.tools.set_job_running(True)
         # 非守护线程：退出流程会先取消任务并等待它结束，保证子进程和暂存目录被清理。
         self._worker = threading.Thread(target=self._run_job, args=(self.job,))
         self._worker.start()
@@ -576,18 +529,16 @@ class MainWindow(QWidget):
         except Exception as e:  # noqa: BLE001
             self.bridge.done.emit(None, e)
 
-    def cancel(self) -> None:
-        """请求核心任务取消或终止安装进程，由完成回调恢复界面。"""
+    def cancel_job(self) -> None:
+        """请求核心任务取消，由完成回调恢复界面；取消安装在工具链窗口中进行。"""
         if self.job:
             self.job.cancel()
-        if self.proc:
-            self._cancel_install()
 
     def on_job_done(self, path: Path | None, err: Exception | None) -> None:
         """在主线程处理结果；path 为成功产物，err 为失败或取消原因。退出途中只记日志不弹窗。"""
         self.job = None
         self._worker = None
-        self.set_busy(False)
+        self.tools.set_job_running(False)
         if err is None:
             assert path is not None
             msg = self._done_message(path)
@@ -651,6 +602,7 @@ class MainWindow(QWidget):
     def closeEvent(self, e: QCloseEvent) -> None:
         """任务或安装进行中时先确认，再取消并等它结束后关闭，不留下孤立进程和暂存文件。"""
         if self._quit_ready or not self.is_busy():
+            self.tools_dialog.hide()
             e.accept()
             return
         e.ignore()
@@ -661,13 +613,14 @@ class MainWindow(QWidget):
             return
         self._quit_requested = True
         self.append_log(tr("quitting"))
-        self.cancel()
+        self.cancel_job()
+        self.tools.cancel_install()
         # 确认框打开期间任务可能已经结束，此时没有完成回调会再来触发关闭，需要在这里检查一次。
         self._maybe_finish_quit()
 
     def _maybe_finish_quit(self) -> None:
         """退出请求已确认且任务和安装都已结束时，真正关闭窗口。"""
-        if self._quit_requested and not self.is_busy():
+        if self._quit_requested and not self._quit_ready and not self.is_busy():
             self._quit_ready = True
             QTimer.singleShot(0, self.close)
 
@@ -677,9 +630,7 @@ class MainWindow(QWidget):
             self.job.cancel()
         if self._worker is not None:
             self._worker.join(10)
-        if self.proc is not None:
-            self.proc.kill()
-            self.proc.waitForFinished(2000)
+        self.tools.kill_install()
 
 
 def settings_scope(bundle_id: str) -> tuple[str, str]:
@@ -718,9 +669,10 @@ def main() -> None:
     settings = QSettings(*settings_scope(core.BUNDLE_ID))
     migrate_legacy_settings(settings)
     set_lang(settings.value("lang") or detect_lang(QLocale.system().uiLanguages()))
+    install_qt_translator()
     w = MainWindow(settings)
     app.aboutToQuit.connect(w.shutdown)
-    w.resize(780, 760)
+    w.resize(780, 640)
     w.show()
     sys.exit(app.exec())
 

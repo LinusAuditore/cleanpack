@@ -9,7 +9,7 @@ CleanPack is a desktop archiving tool built with Python and PySide6. Select or d
 - Supports **tar, tar.gz, tar.xz, tar.zst, zip, and 7z**, with recursive exclusion of macOS junk files.
 - Provides compression level sliders, xz extreme mode, and multithreaded compression for xz, zstd, and 7z.
 - Supports file and folder selection, drag and drop of a single item, Save As, cancellation, and revealing the output in Finder.
-- Detects compression tools, shows missing dependencies and Homebrew installation commands, and provides an install button with live logs.
+- Detects compression tools and warns when the selected format needs a missing one; at startup it also points out a missing Homebrew if a tool still needs it. The Toolchain window (header button or **Tools ▸ Toolchain…**) shows tool paths, the Homebrew command, a one-click install with live logs, and keeps installing in the background if you close it.
 - Offers English, Simplified Chinese, Traditional Chinese, and French interfaces, with support for system light and dark appearance.
 - Replaces the output atomically on success. On failure or cancellation, it cleans up temporary files and preserves existing output. It also prevents overwriting the source file or placing the output inside the source folder.
 
@@ -45,7 +45,7 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-To use the other three formats, install their dependencies with Homebrew or use the install button in the app:
+To use the other three formats, install their dependencies with Homebrew or use the install button in the app's Toolchain window:
 
 ```bash
 brew install xz zstd sevenzip
@@ -85,8 +85,9 @@ Each task creates its own `.cleanpack-*.part/` temporary directory in the output
 ## Project structure
 
 ```text
-main.py             GUI, task coordination, and tool installation
-gui_common.py       Shared Qt helpers: localized number formats and dialogs
+main.py             Main window and task coordination
+tools_dialog.py     Toolchain window, tool detection, and Homebrew installation
+gui_common.py       Shared Qt helpers: styles, Qt translations, localized numbers, dialogs
 core.py             Archiving core, independent of Qt
 i18n.py             Interface strings in four languages
 requirements.txt    Runtime dependencies

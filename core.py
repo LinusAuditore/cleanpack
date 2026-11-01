@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import errno
+import fnmatch
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -153,9 +156,9 @@ def require_tool(key: str, fmt_key: str) -> str:
 
 
 def strip_ext(name: str) -> str:
-    """移除最长的已知归档扩展名，避免把 tar.gz 错当成单独 gz 后缀。"""
+    """移除最长的已知归档扩展名（不区分大小写），避免把 tar.gz 错当成单独 gz 后缀。"""
     for ext in sorted((f.ext for f in FORMATS.values()), key=len, reverse=True):
-        if name.endswith(ext):
+        if name.lower().endswith(ext):
             return name[: -len(ext)]
     return name
 
@@ -193,6 +196,7 @@ _ERRNO_KEYS = {
     errno.ENOSPC: "no_space", errno.EDQUOT: "no_space", errno.EROFS: "read_only",
     errno.EACCES: "access_denied", errno.EPERM: "access_denied",  # EPERM 也覆盖 TCC 受保护目录
     errno.ENOENT: "not_found", errno.ENOTDIR: "not_found", errno.EISDIR: "out_is_dir",
+    errno.ENAMETOOLONG: "name_too_long",
 }
 # 这些文案需要具体路径；系统没有给出文件名时退回 io_error，避免出现残缺句子。
 _PATH_KEYS = {"read_only", "access_denied", "not_found", "out_is_dir"}
@@ -275,6 +279,150 @@ def check_compress_output(src: Path, out: Path) -> None:
     # 指向目录的符号链接会被 os.replace 整体替换为归档，只有真实目录才无法替换。
     if out.is_dir() and not out.is_symlink():
         raise JobError("out_is_dir", path=str(out))
+    # 暂存文件名是「输出名.part」，它也必须在单个文件名的长度上限之内。
+    if _name_units(out.name + _PART_EXT) > _NAME_MAX:
+        raise JobError("name_too_long")
+
+
+# ---------- 键入路径的整理与校验 ----------
+# APFS 按 UTF-16 码元计算单个名称长度，上限 255（实测：255 个汉字可以，128 个 emoji 不行）。
+# HFS+ 先分解再计数，可能更严，那种情况由 ENAMETOOLONG 映射到同一条提示。
+_NAME_MAX = 255
+_PART_EXT = ".part"   # 暂存文件的后缀
+
+
+def _name_units(name: str) -> int:
+    return len(name.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def _unescape(s: str) -> str:
+    return re.sub(r"\\(.)", r"\1", s)
+
+
+def _drop_terminal_escapes(s: str) -> str:
+    """终端会把空格等字符写成「\\ 」。反斜杠也是合法的文件名字符，所以只在原文找不到、
+    而去掉转义后能找到对应项（或其所在文件夹）时才去掉，后者用于键入新的输出文件名。"""
+    if "\\" not in s or os.path.lexists(s):
+        return s
+    unescaped = _unescape(s)
+    if os.path.lexists(unescaped):
+        return unescaped
+    if not os.path.isdir(os.path.dirname(s)) and os.path.isdir(os.path.dirname(unescaped)):
+        return unescaped
+    return s
+
+
+def clean_typed_path(raw: str) -> str:
+    """整理键入或粘贴的路径，返回去掉包装后的字符串；空白输入返回空字符串。
+
+    依次处理：首尾空白、一对首尾相同的引号、file:// URL、~ 和终端拖入时的反斜杠转义。
+    文件名本身可以以空格结尾或含引号、反斜杠，所以原文已经是存在的绝对路径时原样返回；
+    拖放和文件对话框给出的路径也走这里，不会被误改。无法作为路径的输入抛出 path_invalid。
+    """
+    if os.path.isabs(raw) and os.path.lexists(raw):  # lexists 对 NUL 等无效输入返回 False
+        return raw
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        s = s[1:-1]
+    if s[:7].lower() == "file://":
+        try:
+            url = urllib.parse.urlsplit(s)
+        except ValueError:  # 例如 file://[ 这样无法解析的主机名
+            raise JobError("path_invalid", path=s) from None
+        if url.netloc not in ("", "localhost"):
+            raise JobError("path_invalid", path=s)  # 网络位置的 URL 不是本机路径
+        s = urllib.parse.unquote(url.path)
+    _check_encodable(s)
+    return _drop_terminal_escapes(os.path.expanduser(s))
+
+
+def _check_encodable(s: str) -> None:
+    """NUL 和无法编码成文件系统路径的字符（例如孤立的代理项）会让 os 函数抛出
+    ValueError 而不是 OSError，在这里统一报告为无效路径。"""
+    try:
+        if "\0" in s:
+            raise ValueError
+        os.fsencode(s)
+    except ValueError:
+        # 提示里显示的路径也要能正常渲染：去掉 NUL，代理项换成替换字符。
+        shown = s.replace("\0", "").encode("utf-8", "replace").decode()
+        raise JobError("path_invalid", path=shown) from None
+
+
+def _absolute_typed(s: str) -> Path:
+    """要求绝对路径且不含 ..，返回 Path；含 .. 的路径经过符号链接时由系统解析，
+    结果可能和界面上按字面理解的位置不同，所以直接拒绝。"""
+    _check_encodable(s)
+    if not os.path.isabs(s):
+        raise JobError("path_not_absolute")
+    path = Path(s)
+    if ".." in path.parts:
+        raise JobError("path_invalid", path=s)
+    return path
+
+
+def is_junk_name(name: str) -> bool:
+    """名称是否匹配 JUNK 中的任一模式；区分大小写，与 tar、7z 的排除规则一致。"""
+    return any(fnmatch.fnmatchcase(name, p) for p in JUNK)
+
+
+def validate_source(path: Path | str) -> Path:
+    """校验压缩源，返回要压缩的绝对路径；不合格时抛出 JobError。
+
+    path 应已经过 clean_typed_path。源本身是符号链接时返回解析后的目标：tar、zip、7z
+    都只保存顶层链接本身，否则会得到一个只含链接、没有任何内容的“成功”归档
+    （/tmp、/etc 在 macOS 上都是链接）。键入、拖放和文件对话框都调用这里，ArchiveJob
+    开始时也会再查一次，因为源可能在选择之后被删除或替换。
+    """
+    p = _absolute_typed(str(path))
+    if p.name and os.path.islink(p):
+        p = Path(os.path.realpath(p))
+    if not p.name:
+        raise JobError("src_is_root")  # tar 等工具无法以空名称打包整个磁盘
+    try:
+        st = os.stat(p)  # 悬空链接按不存在处理
+    except (FileNotFoundError, NotADirectoryError):
+        raise JobError("src_missing", path=str(p)) from None
+    except PermissionError:
+        raise JobError("src_denied", path=str(p)) from None
+    except OSError as exc:
+        raise job_error_from_os(exc) from exc
+    # 顶层名称本身匹配排除规则时，工具会把整个源排除掉，得到一个“成功”的空归档。
+    if is_junk_name(p.name):
+        raise JobError("src_is_junk", name=p.name.replace("\r", "\\r"))
+    is_dir = stat.S_ISDIR(st.st_mode)
+    if not (is_dir or stat.S_ISREG(st.st_mode)):
+        raise JobError("src_unsupported_type", path=str(p))  # FIFO、设备文件、套接字
+    if not os.access(p, os.R_OK | (os.X_OK if is_dir else 0)):
+        raise JobError("src_denied", path=str(p))
+    return p
+
+
+def parse_output(raw: str, out_dir: Path) -> tuple[Path, str | None] | None:
+    """解析键入的输出位置，返回 (输出目录, 不含扩展名的名称)，名称为 None 表示沿用当前名称。
+
+    留空返回 None，表示恢复自动生成的路径。只写名称时放在 out_dir；以 / 结尾或指向
+    已有文件夹时只更换目录；其余必须是绝对路径。已知的归档扩展名会被去掉，
+    由界面接上当前格式的扩展名，切换格式时不会得到 a.zip.7z 这样的名称。
+    """
+    s = clean_typed_path(raw)
+    if not s:
+        return None
+    if "/" not in s:
+        directory, name = out_dir, s
+    else:
+        path = _absolute_typed(s)
+        try:
+            is_dir = path.is_dir()  # Python 3.13 起，权限不足或名称过长会抛出 OSError
+        except OSError as exc:
+            raise job_error_from_os(exc) from exc
+        if s.endswith("/") or is_dir:
+            return path, None
+        directory, name = path.parent, path.name
+    stem = strip_ext(name)
+    if stem in ("", ".", ".."):
+        raise JobError("path_invalid", path=s)
+    return directory, stem
 
 
 # ---------- ZIP 中央目录解析 ----------
@@ -586,11 +734,13 @@ class ArchiveJob(Job):
         missing = missing_tools(self.fmt.key)
         if missing:
             raise JobError("missing_tools", fmt=self.fmt.key, tools=", ".join(missing))
+        # 源可能在选择之后被删除或替换；源是链接时改用解析后的目标。
+        self.src = validate_source(self.src)
         check_compress_output(self.src, self.out)
 
         # 每个任务独占暂存目录，避免删除已有 .part 文件或与另一个任务互相覆盖。
         with self._staging(self.out.parent) as staging:
-            tmp = staging / (self.out.name + ".part")
+            tmp = staging / (self.out.name + _PART_EXT)
             if self.fmt.key.startswith("tar"):
                 self._run_tar(tmp)
             elif self.fmt.key == "zip":
