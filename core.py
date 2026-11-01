@@ -1,12 +1,17 @@
-"""CleanPack 压缩核心：不依赖 GUI，可单独测试。"""
+"""CleanPack 压缩与解压核心：不依赖 GUI，可单独测试。"""
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import errno
 import fnmatch
+import itertools
 import os
 import re
+import resource
 import shlex
 import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -14,7 +19,6 @@ import sys
 import tempfile
 import threading
 import urllib.parse
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterator
@@ -425,6 +429,362 @@ def parse_output(raw: str, out_dir: Path) -> tuple[Path, str | None] | None:
     return directory, stem
 
 
+def parse_folder(raw: str) -> Path | None:
+    """解析键入的文件夹路径（解压目标）：留空返回 None，否则必须是绝对路径。
+
+    文件夹是否存在、可写由 check_output_dir 检查，作为提示显示，不阻止保存设置。
+    """
+    s = clean_typed_path(raw)
+    return _absolute_typed(s) if s else None
+
+
+# ---------- 解压：格式识别与归档校验 ----------
+# 归档内容的类别，决定用哪条命令解压。tar、gzip、xz、zip 都交给 bsdtar（libarchive
+# 自带解码器），zstd 走管道（本机 bsdtar 未编译 libzstd），7z 用 7-Zip。
+_MAGIC = [  # (偏移, 魔数, 类别)
+    (0, b"\x1f\x8b", "gzip"),
+    (0, b"\xfd7zXZ\x00", "xz"),
+    (0, b"\x28\xb5\x2f\xfd", "zstd"),
+    (0, b"7z\xbc\xaf\x27\x1c", "7z"),
+    (0, b"PK\x03\x04", "zip"),
+    (0, b"PK\x05\x06", "zip"),   # 空 zip 只有结束记录
+    (257, b"ustar", "tar"),      # POSIX/GNU tar 头部的 magic 字段
+]
+_FAMILY_OF_FORMAT = {"tar": "tar", "tar.gz": "gzip", "tar.xz": "xz", "tar.zst": "zstd",
+                     "zip": "zip", "7z": "7z"}
+_FORMAT_OF_FAMILY = {family: fmt for fmt, family in _FAMILY_OF_FORMAT.items()}
+# 解压各类别必需的工具；顺序与管道方向一致。7z 先用 bsdtar（链接原样保留），
+# 7zz 只在 bsdtar 解不了时作为可选的后备，所以不算必需。
+_EXTRACT_TOOLS = {"tar": ("tar",), "gzip": ("tar",), "xz": ("tar",), "zip": ("tar",),
+                  "zstd": ("zstd", "tar"), "7z": ("tar",)}
+
+
+def detect_format(name: str) -> str | None:
+    """按最长扩展名（不区分大小写）返回格式 key，例如 a.TAR.GZ → tar.gz；不支持时返回 None。"""
+    lower = name.lower()
+    for fmt in sorted(FORMATS.values(), key=lambda f: len(f.ext), reverse=True):
+        if lower.endswith(fmt.ext) and len(name) > len(fmt.ext):
+            return fmt.key
+    return None
+
+
+def sniff_family(path: Path | str) -> str | None:
+    """读取文件头魔数返回内容类别；识别不了时返回 None，由扩展名决定。"""
+    with open(path, "rb") as f:
+        head = f.read(262)
+    for offset, magic, family in _MAGIC:
+        if head[offset:offset + len(magic)] == magic:
+            return family
+    return None
+
+
+def extract_family(path: Path) -> str:
+    """决定解压路线：魔数能明确识别时以内容为准（扩展名可能写错），否则按扩展名。"""
+    fmt = detect_format(path.name)
+    sniffed = sniff_family(path)
+    if sniffed is not None:
+        return sniffed
+    if fmt is None:
+        raise JobError("archive_unsupported", name=path.name)
+    return _FAMILY_OF_FORMAT[fmt]
+
+
+def zip_is_encrypted(path: Path) -> bool:
+    """zip 中是否有加密的成员（通用标志位 bit 0，传统加密和 AES 都会设置）；读不了时返回 False。
+
+    必须事先判断：传统 ZipCrypto 只用一个校验字节验证密码，bsdtar 拿任何假密码去试，
+    约有 1/256 的机会被当成正确密码，随后解出乱码并报 CRC 错误，而不是“需要密码”。
+    """
+    try:
+        with open(path, "rb") as stream:
+            # 目录项没有数据，标志位即使被设置也不影响解压。
+            return any(entry.flags & 0x1 and not entry.name.endswith(b"/")
+                       for entry in _read_central_directory(stream))
+    except (OSError, JobError):
+        return False  # 结构异常的 zip 交给 bsdtar 处理并报告
+
+
+def extract_tools(family: str) -> tuple[str, ...]:
+    return _EXTRACT_TOOLS[family]
+
+
+def archive_format(path: Path) -> str:
+    """返回按内容（识别不了时按扩展名）判断出的格式 key，用于界面显示和缺工具提示。"""
+    return _FORMAT_OF_FAMILY[extract_family(path)]
+
+
+def validate_archive(path: Path | str) -> Path:
+    """校验要解压的归档，返回绝对路径；必须是扩展名受支持的普通文件，否则抛出 JobError。
+
+    与 validate_source 一样接受链接并解析到目标，解压结果默认放在归档所在的文件夹。
+    """
+    p = _absolute_typed(str(path))
+    if p.name and os.path.islink(p):
+        p = Path(os.path.realpath(p))
+    try:
+        st = os.stat(p)
+    except (FileNotFoundError, NotADirectoryError):
+        raise JobError("src_missing", path=str(p)) from None
+    except PermissionError:
+        raise JobError("src_denied", path=str(p)) from None
+    except OSError as exc:
+        raise job_error_from_os(exc) from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise JobError("archive_not_file", path=str(p))
+    if detect_format(p.name) is None:
+        raise JobError("archive_unsupported", name=p.name)
+    if not os.access(p, os.R_OK):
+        raise JobError("src_denied", path=str(p))
+    return p
+
+
+# ---------- 解压：整理解出的文件树 ----------
+def _walk_dirs_first(root: Path) -> Iterator[tuple[str, list[str], list[str]]]:
+    """自顶向下遍历，不跟随符号链接；遇到读不了的目录直接抛出 OSError。"""
+    def fail(exc: OSError) -> None:
+        raise exc
+    return os.walk(root, topdown=True, onerror=fail, followlinks=False)
+
+
+_OPEN_MAX = 10240  # macOS 允许单个进程打开的文件数上限（<sys/syslimits.h> 的 OPEN_MAX）
+
+
+def raise_fd_limit() -> None:
+    """把可打开文件数的软上限提高到 OPEN_MAX（不超过硬上限）。
+
+    从 Finder 启动的应用默认只有 256 个。遍历和删除目录树时每一层要占一个描述符，
+    几百层深的归档（解压前无法预知）在默认上限下会失败，失败后的暂存目录也删不掉。
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = _OPEN_MAX if hard == resource.RLIM_INFINITY else min(hard, _OPEN_MAX)
+    if soft < target:
+        with contextlib.suppress(ValueError, OSError):
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+
+
+def _no_check() -> None:
+    """默认的取消检查：什么都不做。"""
+
+
+def make_tree_accessible(root: Path, check: Callable[[], None] = _no_check) -> None:
+    """给每个目录补上 u+rwx。归档里可能有 000 或 500 权限的目录，不补的话无法清理垃圾、
+    检查内容，失败时也删不掉暂存目录。--no-same-permissions 只会去掉组和其他人的位。
+
+    用 os.fwalk 按目录描述符操作，成员路径超过 PATH_MAX 也能处理；每层占一个描述符，
+    调用方需先 raise_fd_limit。check 对每个子目录调用一次，用于响应取消。
+    """
+    os.chmod(root, stat.S_IMODE(os.lstat(root).st_mode) | stat.S_IRWXU)
+    def fail(exc: OSError) -> None:
+        raise exc
+    for _, dirnames, _, dir_fd in os.fwalk(root, topdown=True, onerror=fail,
+                                           follow_symlinks=False):
+        check()
+        for name in dirnames:
+            check()
+            st = os.lstat(name, dir_fd=dir_fd)
+            if stat.S_ISDIR(st.st_mode):  # dirnames 里也包括指向目录的符号链接，不能跟随
+                os.chmod(name, stat.S_IMODE(st.st_mode) | stat.S_IRWXU, dir_fd=dir_fd)
+
+
+def sweep_junk(root: Path, check: Callable[[], None] = _no_check) -> int:
+    """删除树中任意层级名称匹配 JUNK 的项，返回删除个数；不跟随符号链接。
+
+    这是解压垃圾过滤的最终保证：不依赖各工具 exclude 规则的通配细节。check 用于响应取消，
+    对每一项调用一次。
+    """
+    removed = 0
+    for dirpath, dirnames, filenames in _walk_dirs_first(root):
+        check()
+        for name in [n for n in dirnames if is_junk_name(n)]:
+            check()
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                os.unlink(path)
+            else:
+                shutil.rmtree(path)
+            dirnames.remove(name)  # 已删除，不再进入
+            removed += 1
+        for name in filenames:
+            check()
+            if is_junk_name(name):
+                os.unlink(os.path.join(dirpath, name))
+                removed += 1
+    return removed
+
+
+_LINK_HOPS_MAX = 32          # macOS 的 MAXSYMLINKS：一次路径解析最多展开 32 个链接
+_LINK_PARTS_MAX = 16384      # 解析单个链接的工作量上限
+_LINK_WORK_MAX = 2_000_000   # 一棵树里解析全部链接的工作量上限（约一两秒）
+# 工作量按实际开销计：每个分量拼路径、查链接的开销与当前深度成正比，复制缓存的位置与其长度
+# 成正比。只按分量计数的话，恶意归档能让深度不断增长，使总时间随链接数平方增长。
+_LOOP = object()     # 展开的链接数超限：系统也解析不了（ELOOP），不会指向任何地方
+_UNKNOWN = object()  # 处理量超限：无法判断，按可能越界提示
+
+
+class _LinkChecker:
+    """判断树中的符号链接是否指到 boundary（最终放进目标文件夹的那一项）之外。
+
+    逐个分量解析目标，经过树内的其他链接时继续展开；只要某一步的 .. 越过 boundary 就算
+    越界，即使之后又走回来。原因：提交时 boundary 会改名（例如变成「名称 2」）或离开暂存
+    目录，经由上级目录绕回来的路径在提交后会指到别处，可能正是用户已有的同名文件。
+
+    恶意归档可以构造互相引用的长链接，所以总处理量有硬上限：超出后剩下的链接不再解析，
+    判为“无法判断”。缓存只保存与剩余预算无关的结果：最终位置和真正越界随时可缓存；
+    预算耗尽（_LOOP、_UNKNOWN）只在从链接自己所在目录、以完整预算解析时缓存——从别处
+    经过它时剩余预算只会更少，结果不会变好。嵌套解析中途耗尽的结果不缓存。
+    """
+
+    def __init__(self, boundary: str) -> None:
+        self.boundary = boundary
+        self.memo: dict[str, object] = {}  # 链接路径 -> 最终位置、True、_LOOP 或 _UNKNOWN
+        self.work = _LINK_WORK_MAX
+
+    def escapes(self, link: str) -> bool | None:
+        """True 表示越界，False 表示留在 boundary 内或系统也解析不了，None 表示无法判断。"""
+        result = self.memo.get(link)
+        if result is None:
+            rel = os.path.relpath(os.path.dirname(link), self.boundary)
+            stack = [] if rel == "." else rel.split(os.sep)
+            result = self._resolve(stack, os.readlink(link), [_LINK_HOPS_MAX, _LINK_PARTS_MAX])
+            # 总处理量耗尽（self.work < 0）造成的 _UNKNOWN 与这个链接本身无关，不缓存。
+            if result is not _UNKNOWN or self.work >= 0:
+                self.memo[link] = result
+        if result is _UNKNOWN:
+            return None
+        return result is True
+
+    def _resolve(self, stack: list[str], target: str, budget: list[int]) -> object:
+        """从 stack 所在目录出发解析 target；返回最终位置、True（越界）、_LOOP 或 _UNKNOWN。
+
+        budget 是这次顶层解析剩余的 [链接展开数, 分量数]。
+        """
+        if os.path.isabs(target):
+            return True
+        stack = list(stack)
+        for part in target.split("/"):
+            if part in ("", "."):
+                cost = 1
+            elif part == "..":
+                cost = 1
+            else:
+                cost = len(stack) + 1  # 下面要拼出完整路径并查询一次
+            budget[1] -= cost
+            self.work -= cost
+            if budget[1] < 0 or self.work < 0:
+                return _UNKNOWN
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not stack:
+                    return True
+                stack.pop()
+                continue
+            path = os.path.join(self.boundary, *stack, part)
+            if not os.path.islink(path):
+                stack.append(part)
+                continue
+            result = self.memo.get(path)
+            if result is None:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    return _LOOP
+                result = self._resolve(stack, os.readlink(path), budget)
+                if result is True or isinstance(result, list):
+                    self.memo[path] = result
+            if not isinstance(result, list):
+                return result
+            budget[1] -= len(result)  # 复制缓存的位置
+            self.work -= len(result)
+            if budget[1] < 0 or self.work < 0:
+                return _UNKNOWN
+            stack = list(result)
+        return stack
+
+
+def _link_escapes(boundary: str, link: str) -> bool:
+    """单独判断一个链接是否越界；无法判断时按越界处理。"""
+    return _LinkChecker(boundary).escapes(link) is not False
+
+
+def verify_tree(root: Path, boundary: Path | None = None,
+                check: Callable[[], None] = _no_check) -> list[JobError]:
+    """检查解出的文件树，返回需要告知用户的警告；发现不安全的项时抛出 JobError。
+
+    - FIFO、套接字、设备文件：unsafe_entry，整个任务失败；
+    - 与树外文件共享 inode 的硬链接：unsafe_link，修改它会改到树外的文件；
+    - 普通文件去掉 setuid、setgid 和 sticky 位；
+    - 指向 boundary（默认 root，即最终放进目标文件夹的那一项）之外的符号链接保留
+      （CleanPack 自己的归档也可能包含），但逐个警告；复杂到无法在处理量上限内判断的
+      链接合并为一条 links_unchecked 提示。
+
+    check 对每一项调用一次，用于响应取消。
+    """
+    root_s = os.path.normpath(str(root))
+    bound = os.path.normpath(str(boundary or root))
+    warnings: list[JobError] = []
+    inode_seen: dict[tuple[int, int], int] = {}
+    inode_nlink: dict[tuple[int, int], tuple[int, str]] = {}
+    links = _LinkChecker(bound)
+    unchecked = 0
+    for dirpath, dirnames, filenames in _walk_dirs_first(root):
+        for name in dirnames + filenames:
+            check()  # 每一项检查一次：一个目录里可能有成千上万个需要解析的链接
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root_s)
+            st = os.lstat(path)
+            mode = st.st_mode
+            if stat.S_ISLNK(mode):
+                escapes = links.escapes(path)
+                if escapes:
+                    warnings.append(JobError("link_outside", name=rel, target=os.readlink(path)))
+                elif escapes is None:
+                    unchecked += 1
+            elif stat.S_ISREG(mode):
+                key = (st.st_dev, st.st_ino)
+                inode_seen[key] = inode_seen.get(key, 0) + 1
+                inode_nlink[key] = (st.st_nlink, rel)
+                if mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+                    os.chmod(path, stat.S_IMODE(mode) & ~(stat.S_ISUID | stat.S_ISGID
+                                                          | stat.S_ISVTX))
+            elif not stat.S_ISDIR(mode):
+                raise JobError("unsafe_entry", name=rel)
+    for key, (nlink, rel) in inode_nlink.items():
+        if nlink > inode_seen[key]:
+            raise JobError("unsafe_link", name=rel)
+    if unchecked:
+        warnings.append(JobError("links_unchecked", n=unchecked))
+    return warnings
+
+
+def unique_names(folder: Path, name: str, is_dir: bool) -> Iterator[Path]:
+    """依次给出 Finder 风格的候选路径：名称、名称 2、名称 3……
+
+    文件的序号插在最后一个扩展名之前（report 2.pdf）；文件夹和以点开头的名称直接追加。
+    """
+    stem, ext = (name, "") if is_dir else os.path.splitext(name)
+    yield folder / name
+    n = 2
+    while True:
+        yield folder / f"{stem} {n}{ext}"
+        n += 1
+
+
+def plan_layout(root: Path, archive_name: str) -> tuple[Path, str, bool]:
+    """决定提交方式，返回 (要移动的路径, 首选名称, 是否为目录)。
+
+    智能放置：只有一个顶层项且不是符号链接时，直接放进目标文件夹；否则把整个
+    解出的树包进以归档名（去掉扩展名）命名的文件夹。没有内容时抛出 extract_empty。
+    """
+    entries = sorted(os.listdir(root))
+    if not entries:
+        raise JobError("extract_empty")
+    if len(entries) == 1:
+        only = root / entries[0]
+        if not only.is_symlink():
+            return only, entries[0], only.is_dir()
+    return root, strip_ext(archive_name) or archive_name, True
+
+
 # ---------- ZIP 中央目录解析 ----------
 # 按 PKWARE APPNOTE 的固定头部布局解析，不依赖 zipfile 的内部属性。
 _EOCD = struct.Struct("<4sHHHHIIH")                  # 中央目录结束记录，22 字节
@@ -437,10 +797,11 @@ _U16_MAX, _U32_MAX = 0xFFFF, 0xFFFFFFFF
 
 @dataclass(frozen=True)
 class _ZipEntry:
-    """中央目录中的一项：中央头与本地头的绝对偏移，以及原始文件名字节。"""
+    """中央目录中的一项：中央头与本地头的绝对偏移、原始文件名字节和通用标志位。"""
     central: int
     local: int
     name: bytes
+    flags: int = 0
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -544,11 +905,14 @@ def _read_central_directory(stream: BinaryIO) -> list[_ZipEntry]:
         # 本地头必须位于中央目录之前；越界的偏移说明归档已损坏。
         if not 0 <= local < cd_start:
             raise JobError("zip_invalid")
-        entries.append(_ZipEntry(cd_start + i, local, name))
+        entries.append(_ZipEntry(cd_start + i, local, name, h[3]))
         i = end
     if len(entries) != n_total:
         raise JobError("zip_invalid")
     return entries
+
+
+_LOG_LINE_MAX = 2000  # 单行日志的最大字符数
 
 
 def _blame(results: list[tuple[str, int]], downstream: bool) -> tuple[str, int] | None:
@@ -558,10 +922,32 @@ def _blame(results: list[tuple[str, int]], downstream: bool) -> tuple[str, int] 
     tar 写管道会因 SIGPIPE 或 EPIPE（bsdtar 以退出码 1 结束）失败，这只是连带结果。
     为 False 时归咎最上游：解压管道里数据损坏会让下游的 tar 也跟着失败。
     """
+    if not downstream:
+        # 解压方向：tar 读到结束标记或出错就会退出，上游的解码器写管道时被 SIGPIPE 杀死只是
+        # 连带结果。数据本身是否完整由调用方事先校验（例如 zstd -t）。
+        results = [(tool, rc) for tool, rc in results if rc != -signal.SIGPIPE]
     failed = [(tool, rc) for tool, rc in results if rc]
     if not failed:
         return None
     return failed[-1] if downstream else failed[0]
+
+
+def _remove_tree(path: Path) -> None:
+    """尽力删除暂存目录，不抛出异常（清理失败不能盖过任务本身的结果）。
+
+    先补权限再用 shutil.rmtree；它每层占一个文件描述符，极深的树在描述符上限很低时会失败，
+    这时退回系统的 chmod -R 和 rm -rf：它们基于 fts 逐级进入目录，描述符用量与深度无关，
+    也不跟随符号链接。
+    """
+    try:
+        make_tree_accessible(path)
+        shutil.rmtree(path)
+        return
+    except OSError:
+        pass
+    for cmd in (["/bin/chmod", "-R", "-P", "u+rwx", str(path)], ["/bin/rm", "-rf", str(path)]):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, env=ENV)
 
 
 class Job:
@@ -569,6 +955,11 @@ class Job:
 
     run 在工作线程执行，cancel 可由主线程调用。
     """
+
+    # 是否让工具脱离应用的控制终端。从终端启动应用时，bsdtar 遇到加密 zip 会直接读
+    # /dev/tty 等密码，stdin=DEVNULL 挡不住；只有解压需要，代价是应用被强行杀掉时
+    # 工具进程不会随终端会话一起收到信号（正常退出和取消仍会结束它们）。
+    _new_session = False
 
     def __init__(self, log: Callable[[str], None] = print) -> None:
         """log 接收命令行和工具输出，每次一行。"""
@@ -608,16 +999,17 @@ class Job:
         if self._cancel.is_set():
             raise Cancelled()
 
-    @contextmanager
+    @contextlib.contextmanager
     def _staging(self, parent: Path) -> Iterator[Path]:
         """在 parent 下创建独占暂存目录；退出前先回收子进程，再删除目录。"""
         # 暂存目录与输出在同一文件系统，os.replace 才能保证原子提交。
-        with tempfile.TemporaryDirectory(prefix=_STAGING_PREFIX, suffix=_STAGING_SUFFIX,
-                                         dir=parent, ignore_cleanup_errors=True) as staging:
-            try:
-                yield Path(staging)
-            finally:
-                self._cleanup_processes()
+        staging = Path(tempfile.mkdtemp(prefix=_STAGING_PREFIX, suffix=_STAGING_SUFFIX,
+                                        dir=parent))
+        try:
+            yield staging
+        finally:
+            self._cleanup_processes()
+            _remove_tree(staging)
 
     def _cleanup_processes(self) -> None:
         """回收管道两端和日志线程，保证失败或取消后才开始清理暂存目录。"""
@@ -642,9 +1034,11 @@ class Job:
         kw 传给 Popen，返回已登记的进程。
         """
         self._check_cancel()
-        self.log("$ " + shlex.join(cmd))
+        # 排除规则里的 Icon\r 含回车符，原样记录会把日志行截断，这里显示成转义形式。
+        self.log("$ " + shlex.join(cmd).replace("\r", "\\r"))
         # 不继承应用的标准输入：工具意外读取输入时立即读到 EOF，而不是让任务一直等待。
         kw.setdefault("stdin", subprocess.DEVNULL)
+        kw.setdefault("start_new_session", self._new_session)
         # 与 cancel 共用锁，防止取消落在进程创建和登记之间而漏杀进程。
         with self._procs_lock:
             self._check_cancel()
@@ -666,6 +1060,9 @@ class Job:
         def run() -> None:
             for raw in iter(stream.readline, b""):
                 line = raw.decode("utf-8", "replace").rstrip()
+                if len(line) > _LOG_LINE_MAX:
+                    # 例如 bsdtar 反复提示输入密码时，一行可达上百 KB，会拖慢日志控件。
+                    line = line[:_LOG_LINE_MAX] + "…"
                 if line:
                     self.log(line)
             stream.close()
@@ -845,3 +1242,308 @@ class ArchiveJob(Job):
         cmd += [f"-xr!{p}" for p in JUNK]
         # 退出码 1 可能表示部分文件未读到，_run_simple 会把它当作失败，不提交不完整的归档。
         self._run_simple(cmd, tool="7z", cwd=self.src.parent)
+
+
+# ---------- 解压：提交与隔离属性 ----------
+_RENAME_EXCL = 0x00000004  # <sys/stdio.h>：目标已存在时以 EEXIST 失败
+
+
+def _load_renamex_np() -> Callable[[bytes, bytes, int], int] | None:
+    """返回 libc 的 renamex_np；不是 macOS 或找不到时返回 None。"""
+    try:
+        func = ctypes.CDLL(None, use_errno=True).renamex_np
+    except (OSError, AttributeError):
+        return None
+    func.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    func.restype = ctypes.c_int
+    return func
+
+
+_renamex_np = _load_renamex_np()
+
+
+def rename_noreplace(src: Path, dst: Path) -> None:
+    """把 src 改名为 dst，绝不覆盖已有内容；dst 已存在时抛出 FileExistsError。
+
+    os.rename 会静默替换空文件夹，在不区分大小写的卷上连只差大小写的名称也会替换。
+    renamex_np 的 RENAME_EXCL 由内核原子判断，大小写和 Unicode 规范化变体都算已存在。
+    不支持它的文件系统（exFAT、部分网络卷）退回到先独占创建占位、再替换自己占位的做法。
+    """
+    if _renamex_np is not None:
+        if _renamex_np(os.fsencode(src), os.fsencode(dst), _RENAME_EXCL) == 0:
+            return
+        err = ctypes.get_errno()
+        if err not in (errno.ENOTSUP, errno.EINVAL):
+            raise OSError(err, os.strerror(err), str(src), None, str(dst))
+    is_dir = src.is_dir() and not src.is_symlink()
+    if is_dir:
+        os.mkdir(dst, 0o700)  # 已存在时抛 FileExistsError
+    else:
+        os.close(os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    try:
+        # 目标是刚创建的空占位：目录改名到空目录、文件替换文件都是原子的；
+        # 若有人往占位目录里放了东西，rename 会以 ENOTEMPTY 失败而不是覆盖。
+        os.rename(src, dst)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.rmdir(dst) if is_dir else os.unlink(dst)
+        raise
+
+
+_QUARANTINE = "com.apple.quarantine"
+_XATTR = "/usr/bin/xattr"
+
+
+def read_quarantine(path: Path) -> str | None:
+    """返回文件的隔离属性值（从浏览器等处下载的文件才有）；没有或读取失败时返回 None。"""
+    try:
+        r = subprocess.run([_XATTR, "-p", _QUARANTINE, str(path)], capture_output=True,
+                           text=True, stdin=subprocess.DEVNULL, env=ENV, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = r.stdout.strip()
+    return value if r.returncode == 0 and value else None
+
+
+def _run_xattr(cmd: list[str]) -> tuple[int, str]:
+    """独立运行 xattr，返回 (退出码, 合并后的输出)；任务内改用可取消的 Job._run_capture。"""
+    r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, env=ENV)
+    return r.returncode, r.stderr or r.stdout
+
+
+def apply_quarantine(root: Path, value: str,
+                     run: Callable[[list[str]], tuple[int, str]] = _run_xattr,
+                     check: Callable[[], None] = _no_check) -> JobError | None:
+    """把隔离属性递归写到 root 下的每一项，返回失败时的警告；不跟随符号链接。
+
+    让 Gatekeeper 像对待下载的归档一样检查解出的程序。-s 作用于链接本身，否则归档里
+    指向外部的链接会让属性写到解压目录之外。写属性需要文件可写，只读文件临时补上 u+w。
+    run 执行 xattr 命令，check 对每个目录调用一次，二者都用于让取消及时生效。
+    """
+    restore: list[tuple[str, int]] = []
+    try:
+        for dirpath, _, filenames in _walk_dirs_first(root):
+            check()
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                st = os.lstat(path)
+                if stat.S_ISREG(st.st_mode) and not st.st_mode & stat.S_IWUSR:
+                    mode = stat.S_IMODE(st.st_mode)
+                    os.chmod(path, mode | stat.S_IWUSR)
+                    restore.append((path, mode))
+        try:
+            code, output = run([_XATTR, "-w", "-r", "-s", _QUARANTINE, value, str(root)])
+            failure = (output.strip().splitlines() or [f"exit {code}"])[0] if code else None
+        except OSError as exc:
+            failure = exc.strerror or str(exc)
+        except JobError as exc:
+            # 任务内经 Job._spawn 启动时，启动失败表现为 tool_start_failed；隔离属性只是附加
+            # 步骤，失败只提示，不让整个解压失败。取消（Cancelled）不在此列，照常传出。
+            if exc.key != "tool_start_failed":
+                raise
+            failure = str(exc.kw.get("err", ""))
+    finally:
+        for path, mode in restore:
+            os.chmod(path, mode)
+    return JobError("quarantine_failed", err=failure) if failure else None
+
+
+# ---------- 解压任务 ----------
+# 解压时 bsdtar 的公共选项：不恢复属主、权限位（按 umask）、扩展属性、ACL、文件标志和
+# 资源分叉，避免归档把这些元数据强加到用户的文件上。--passphrase 给一个假密码：
+# 加密的 zip 立即以“密码错误”失败，不会反复提示上万次。
+_BSDTAR_EXTRACT = ["--no-same-owner", "--no-same-permissions", "--no-xattrs", "--no-acls",
+                   "--no-fflags", "--no-mac-metadata", "--passphrase", "cleanpack-no-password"]
+# 工具报告“归档已加密”的原话。成员名会出现在同一行里，所以按各工具的行格式锚定：
+# bsdtar 是「成员: 消息[: Unknown error: -1]」，消息在行尾；7-Zip 的消息在行首，成员名在
+# 「 : 」之后。这样成员名既不能伪造出加密提示，也不会把真正的提示挡掉。
+_BSDTAR_ENCRYPTED = re.compile(
+    r"(^|: )(Incorrect passphrase|Passphrase required for this entry"
+    r"|The (archive header|file content) is encrypted, but currently not supported"
+    r"|Encrypted file is unsupported)(: [A-Za-z ]*error: -?\d+)?$")
+_SEVENZIP_ENCRYPTED = re.compile(
+    r"^(ERROR: )?(Data Error in encrypted file\. Wrong password\? : "
+    r"|Cannot open encrypted archive\. Wrong password\?$)")
+
+
+def _mentions_encryption(line: str, tool: str) -> bool:
+    """判断 tool（"tar" 或 "7z"）输出的这一行是否在报告归档已加密。"""
+    if tool == "7z":
+        return bool(_SEVENZIP_ENCRYPTED.search(line))
+    return bool(_BSDTAR_ENCRYPTED.search(line))
+
+
+class ExtractJob(Job):
+    """一次性解压任务：解到输出目录下的独占暂存目录，清理垃圾、检查安全后智能放置。
+
+    run 返回最终放置的路径；warnings 收集指向外部的链接等提示。skipped 是最终清理删掉的
+    垃圾项数，不含工具排除规则已经挡掉的部分，只用于测试和排查。
+    """
+    _new_session = True
+
+    def __init__(self, archive: Path | str, dest: Path | str,
+                 log: Callable[[str], None] = print) -> None:
+        """archive 为归档路径，dest 为放置结果的文件夹，log 接收命令行和工具输出。"""
+        self._user_log = log
+        self._encrypted = False
+        self._decoder = "tar"  # 当前产生输出的解压工具，决定按哪种格式识别加密提示
+        self._damaged = False
+        self.archive = Path(archive).absolute()
+        self.dest = Path(dest).absolute()
+        super().__init__(self._log_line)
+        self.warnings: list[JobError] = []
+        self.skipped = 0
+
+    def _log_line(self, line: str) -> None:
+        """转发日志，同时留意工具报告的加密提示，失败时给出更明确的原因。"""
+        if not line.startswith("$ ") and _mentions_encryption(line, self._decoder):
+            self._encrypted = True
+        # bsdtar 跳过损坏的 tar 头时只打印这一行并继续，退出码仍可能是 0，跳过的项会悄悄丢失。
+        if self._decoder == "tar" and line == "tar: Damaged tar archive":
+            self._damaged = True
+        self._user_log(line)
+
+    def _execute(self) -> Path:
+        """校验、解压、整理并提交，返回放置后的路径；失败或取消时暂存目录整个删除。"""
+        self._check_cancel()
+        raise_fd_limit()
+        self.archive = validate_archive(self.archive)
+        family = extract_family(self.archive)
+        fmt = _FORMAT_OF_FAMILY[family]
+        missing = [t for t in extract_tools(family) if locate(t) is None]
+        if missing:
+            raise JobError("missing_tools", fmt=fmt, tools=", ".join(missing))
+        check_output_dir(self.dest)
+        # 开头有额外数据（例如自解压程序）的 zip 没有魔数，按扩展名路由到 bsdtar 后它仍会当作
+        # zip 读取；所以扩展名决定路线时也要检查，避免假密码被偶然接受。
+        if ((family == "zip" or sniff_family(self.archive) is None)
+                and zip_is_encrypted(self.archive)):
+            raise JobError("archive_encrypted")
+        quarantine = read_quarantine(self.archive)
+
+        with self._staging(self.dest) as staging:
+            root = staging / "x"
+            root.mkdir()
+            self._extract(family, root)
+            self._check_cancel()
+            make_tree_accessible(root, self._check_cancel)
+            self.skipped = sweep_junk(root, self._check_cancel)
+            # exFAT、FAT 等不支持扩展属性的卷上，系统用「._名称」文件保存属性（例如
+            # com.apple.provenance），暂存目录里会多出 ._x。它不是越界写入的内容。
+            sidecar = "._x"
+            if set(os.listdir(staging)) - {"x", sidecar}:
+                raise JobError("unsafe_path")  # 有内容写到了解压根目录之外
+            src, name, is_dir = plan_layout(root, self.archive.name)
+            # 链接是否越界以最终放进目标文件夹的那一项为界。
+            self.warnings += verify_tree(root, src if is_dir else root, self._check_cancel)
+            if quarantine:
+                self._copy_quarantine(root, quarantine, staging / sidecar)
+            if src == root:
+                # 整个 x 改名放进目标时，exFAT 驱动会把 ._x 一起带过去，变成用户文件夹里的
+                # ._名称；提交前删掉它。
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(staging / sidecar)
+            self._check_cancel()
+            return self._commit(src, name, is_dir)
+
+    def _copy_quarantine(self, root: Path, value: str, sidecar: Path) -> None:
+        """把归档的隔离属性写到解出的内容上；卷只能用 ._ 文件保存属性时跳过并提示，
+        否则每个文件旁边都会多出一个 AppleDouble 文件，正是本应用要避免的垃圾。"""
+        if os.path.lexists(sidecar):
+            self.warnings.append(JobError("quarantine_skipped"))
+        elif problem := apply_quarantine(root, value, self._run_capture, self._check_cancel):
+            self.warnings.append(problem)
+
+    def _run_capture(self, cmd: list[str]) -> tuple[int, str]:
+        """以登记的进程运行 cmd（取消时会被结束），返回 (退出码, 合并后的输出)。"""
+        p = self._spawn(cmd, tool=os.path.basename(cmd[0]), stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT)
+        output = p.communicate()[0].decode("utf-8", "replace")
+        self._check_cancel()
+        return p.returncode, output
+
+    def _extract(self, family: str, root: Path) -> None:
+        """按类别运行解压命令并检查结果；失败的工具会留下补零的残缺文件，所以任何非 0 退出码
+        都算失败，bsdtar 报告跳过了损坏的头部时也算失败。"""
+        self._run_decoder(family, root)
+        if self._damaged:
+            raise JobError("archive_damaged")
+
+    def _run_decoder(self, family: str, root: Path) -> None:
+        """运行解压命令：tar.zst 走管道，其余先用 bsdtar，7z 解不了时改用 7-Zip。"""
+        tar = require_tool("tar", _FORMAT_OF_FAMILY[family])
+        excludes = [arg for p in JUNK for arg in ("--exclude", p)]
+        if family == "zstd":
+            # 本机 bsdtar 没有 libzstd，它会自己去 PATH 找 zstd；显式管道才能分别检查两端退出码。
+            # tar 读到结束标记就会退出，zstd 可能读不到流末尾的校验和；先完整校验一遍，
+            # 损坏的数据不会被当成成功解出（zstd 解码很快，这一遍的代价不大）。
+            zstd = require_tool("zstd", "tar.zst")
+            self._run_simple([zstd, "-t", "-q", str(self.archive)], tool="zstd", cwd=root)
+            self._run_pipeline([zstd, "-d", "-c", "-q", str(self.archive)],
+                               [tar, "-x", "-f", "-", *_BSDTAR_EXTRACT, *excludes],
+                               tools=("zstd", "tar"), cwd=root, stdout=subprocess.DEVNULL,
+                               blame_downstream=False)
+            return
+        try:
+            self._run_simple([tar, "-x", "-f", str(self.archive), *_BSDTAR_EXTRACT, *excludes],
+                             tool="tar", cwd=root, stdout=subprocess.DEVNULL)
+            return
+        except JobError as exc:
+            if self._encrypted:
+                raise JobError("archive_encrypted") from exc
+            if family != "7z":
+                raise
+            seven = locate("7z")
+            if seven is None:
+                # 系统 tar 读不了这个 7z 的编码方式，装上 7-Zip 就能解开，要明确告诉用户。
+                raise JobError("archive_needs_7z") from exc
+            self.log("→ 7z")
+        self._run_7z_fallback(seven, root)
+
+    def _run_7z_fallback(self, seven: str, root: Path) -> None:
+        """bsdtar 解不了的 7z（少见的编码组合）改用 7-Zip，在清空的解压根目录里重来。
+
+        -snld 只保留解析后仍在输出目录内的相对链接，越界的相对链接会被拒绝并以 2 退出；
+        -spd 关闭文件名通配，否则名为 a*.7z 的归档会连同旁边匹配的归档一起解开；
+        -p 给出空密码，加密归档立即失败而不是等待输入。
+        """
+        make_tree_accessible(root, self._check_cancel)
+        shutil.rmtree(root)
+        root.mkdir()
+        self._decoder = "7z"
+        cmd = [seven, "x", "-y", "-bsp0", "-bb1", "-snld", "-spd", "-p", f"-o{root}",
+               *[f"-xr!{p}" for p in JUNK], str(self.archive)]
+        try:
+            self._run_simple(cmd, tool="7z", cwd=root)
+        except JobError as exc:
+            if self._encrypted:
+                raise JobError("archive_encrypted") from exc
+            raise
+        _restore_rerooted_links(root)
+
+    def _commit(self, src: Path, name: str, is_dir: bool) -> Path:
+        """按「名称」「名称 2」……依次尝试，用不覆盖的改名把结果放进目标文件夹。"""
+        for candidate in itertools.islice(unique_names(self.dest, name, is_dir), 10000):
+            try:
+                rename_noreplace(src, candidate)
+                return candidate
+            except FileExistsError:
+                continue
+        raise JobError("io_error", err=os.strerror(errno.EEXIST))
+
+
+def _restore_rerooted_links(root: Path) -> None:
+    """7-Zip 解压时把绝对路径的链接目标改写到输出目录之下（/etc/hosts 变成 <root>/etc/hosts），
+    提交后它们会悬空。按用户的决定，链接应原样保留并警告，这里去掉前缀恢复原目标。"""
+    prefixes = {str(root), os.path.realpath(root)}
+    for dirpath, dirnames, filenames in _walk_dirs_first(root):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            if not os.path.islink(path):
+                continue
+            target = os.readlink(path)
+            for prefix in prefixes:
+                if target == prefix or target.startswith(prefix + "/"):
+                    os.unlink(path)
+                    os.symlink(target[len(prefix):] or "/", path)
+                    break

@@ -1,4 +1,4 @@
-"""CleanPack GUI（PySide6）。运行：python3 main.py"""
+"""CleanPack GUI（PySide6）：压缩与解压两种模式。运行：python3 main.py"""
 from __future__ import annotations
 
 import sys
@@ -11,17 +11,20 @@ from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QGu
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QMenuBar, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QSlider, QVBoxLayout,
+                               QProgressBar, QPushButton, QSlider, QTabBar, QVBoxLayout,
                                QWidget)
 
 import core
 from gui_common import (NOTE_STYLE, WARN_STYLE, PathInput, confirm, format_secs,
                         format_size, install_qt_translator, process_environment)
+from extract_panel import ExtractPanel
 from i18n import LANGS, current_lang, detect_lang, set_lang, tr
 from tools_dialog import ToolchainController, ToolsDialog, brew_notice
 
 # 首次启动时的默认格式：只用 macOS 自带工具即可完成，不会一打开就提示缺少工具。
 DEFAULT_FORMAT = "zip"
+# 模式切换标签的顺序，也是偏好 mode 的取值。
+MODES = ("compress", "extract")
 
 
 class Bridge(QObject):
@@ -39,7 +42,7 @@ class MainWindow(QWidget):
         self.src: Path | None = None
         self.out_dir: Path | None = None
         self.out_stem: str | None = None
-        self.job: core.ArchiveJob | None = None
+        self.job: core.Job | None = None
         self._worker: threading.Thread | None = None
         self._quit_requested = False
         self._quit_ready = False
@@ -65,6 +68,9 @@ class MainWindow(QWidget):
         self.tools.refresh()
         self.on_format_changed()
         self.retranslate()
+        mode = self.settings.value("mode")
+        self.mode_tabs.setCurrentIndex(MODES.index(mode) if mode in MODES else 0)
+        self.on_mode_changed()
         # 在终端里装好工具后切回应用，横幅应自动更新，不必打开工具链窗口。
         QGuiApplication.instance().applicationStateChanged.connect(self.on_app_state_changed)
         QTimer.singleShot(300, lambda: brew_notice(self, self.tools))
@@ -74,8 +80,12 @@ class MainWindow(QWidget):
         """按视觉顺序组装界面；各分组负责创建自己的控件和信号连接。"""
         root = QVBoxLayout(self)
         root.addLayout(self._build_header())
+        root.addLayout(self._build_mode_bar())
         root.addWidget(self._build_source_group())
         root.addWidget(self._build_options_group())
+        self.extract_panel = ExtractPanel()
+        self.extract_panel.changed.connect(self.update_go_state)
+        root.addWidget(self.extract_panel)
         root.addWidget(self._build_log_group(), 1)
         root.addLayout(self._build_banner())
         root.addLayout(self._build_actions())
@@ -102,6 +112,19 @@ class MainWindow(QWidget):
         top.addWidget(self.lang_combo)
         top.addWidget(self.btn_tools)
         return top
+
+    def _build_mode_bar(self) -> QHBoxLayout:
+        """构建居中的「压缩 | 解压」模式切换，返回布局；切换时只显示当前模式的分组。"""
+        bar = QHBoxLayout()
+        self.mode_tabs = QTabBar()
+        for _ in MODES:
+            self.mode_tabs.addTab("")
+        self.mode_tabs.setDrawBase(False)
+        self.mode_tabs.currentChanged.connect(self.on_mode_changed)
+        bar.addStretch()
+        bar.addWidget(self.mode_tabs)
+        bar.addStretch()
+        return bar
 
     def _build_menu(self) -> None:
         """在 macOS 菜单栏加入「工具 ▸ 工具链…」；无父对象的 QMenuBar 会成为全局菜单栏。"""
@@ -251,12 +274,37 @@ class MainWindow(QWidget):
         self.excl_lbl.setText(tr("excluded", list=junk))
         self.log_box.setTitle(tr("log"))
         self.btn_cancel.setText(tr("cancel"))
-        self.btn_go.setText(tr("compress"))
+        for i, mode in enumerate(MODES):
+            self.mode_tabs.setTabText(i, tr(f"mode_{mode}"))
+        self.btn_go.setText(tr("extract") if self.is_extract() else tr("compress"))
+        self.extract_panel.retranslate()
         self.tools_dialog.retranslate()
         self.on_level_changed()
         self.refresh_busy_ui()
 
-    # ---------------- 语言 / 格式 / 级别 ----------------
+    # ---------------- 模式 / 语言 / 格式 / 级别 ----------------
+    def is_extract(self) -> bool:
+        return self.mode_tabs.currentIndex() == MODES.index("extract")
+
+    def on_mode_changed(self) -> None:
+        """切换压缩与解压：只显示当前模式的分组，主按钮随之改名；记住所选模式。"""
+        extract = self.is_extract()
+        self.settings.setValue("mode", MODES[self.mode_tabs.currentIndex()])
+        # 离开的模式里未提交的草稿作废：否则它会一直挂在隐藏的输入框里，之后在开始时被提交，
+        # 把用户在那之后选好的输出或目标重置掉。
+        panel = self.extract_panel
+        for field in ((self.src_input, self.out_input) if extract
+                      else (panel.arc_input, panel.dest_input)):
+            field.revert()
+        self.src_box.setVisible(not extract)
+        self.opt_box.setVisible(not extract)
+        self.extract_panel.setVisible(extract)
+        self.btn_go.setText(tr("extract") if extract else tr("compress"))
+        if not self.is_busy():
+            # 在另一个模式期间，这个模式的路径可能已在 Finder 里被删除或创建。
+            (self.extract_panel if extract else self.src_input).recheck()
+        self.refresh_busy_ui()
+
     def on_lang_changed(self) -> None:
         """保存用户选择的语言，并刷新可见标签和 Qt 自带文案的翻译。"""
         code = self.lang_combo.currentData()
@@ -387,10 +435,14 @@ class MainWindow(QWidget):
             e.acceptProposedAction()
 
     def dropEvent(self, e: QDropEvent) -> None:
-        """把有效拖放转为源路径选择，安装或压缩期间保持输入不变。"""
+        """把有效拖放交给当前模式：压缩模式作为源，解压模式作为归档；不会自动切换模式。"""
         urls = e.mimeData().urls()
         if len(urls) == 1 and urls[0].isLocalFile() and not self.is_busy():
-            self.set_source(urls[0].toLocalFile())
+            path = urls[0].toLocalFile()
+            if self.is_extract():
+                self.extract_panel.set_archive(path)
+            else:
+                self.set_source(path)
             e.acceptProposedAction()
 
     # ---------------- 工具链 ----------------
@@ -407,12 +459,20 @@ class MainWindow(QWidget):
         if not self.tools.installing:
             self.tools.refresh()
         if not self.is_busy():
-            self.src_input.recheck()  # 发出 checked，随后刷新按钮和输出提示
+            # 发出 checked，随后刷新按钮和输出提示。
+            (self.extract_panel if self.is_extract() else self.src_input).recheck()
+
+    def missing_tools(self) -> tuple[str | None, list[str]]:
+        """返回当前模式涉及的格式和它缺少的工具；解压模式按已提交归档的实际格式判断。"""
+        if self.is_extract():
+            return (self.extract_panel.format_key(),
+                    self.extract_panel.missing_tools(self.tools.paths))
+        fmt = self.current_format().key
+        return fmt, self.tools.missing_for(fmt)
 
     def update_banner(self) -> None:
         """只在当前格式缺工具或正在安装时显示横幅；文案不写位置，按钮直接打开工具链窗口。"""
-        fmt = self.current_format().key
-        missing = self.tools.missing_for(fmt)
+        fmt, missing = self.missing_tools()
         if self.tools.installing:
             text, button = tr("installing_banner"), tr("tools_btn")
         elif missing and not any(core.TOOLS[t].formula for t in missing):
@@ -429,15 +489,26 @@ class MainWindow(QWidget):
         self.warn_lbl.setVisible(bool(text))
         self.banner_btn.setVisible(bool(text))
 
-    # ---------------- 压缩 ----------------
+    # ---------------- 任务 ----------------
     def is_busy(self) -> bool:
         return self.job is not None or self.tools.installing
 
     def update_go_state(self) -> None:
-        """根据输入、输出预检、工具缺失和忙碌状态决定压缩按钮、输出控件及横幅内容。"""
+        """根据当前模式的输入、预检、工具缺失和忙碌状态决定主按钮、相关控件及横幅内容。"""
         busy = self.is_busy()
-        missing = self.tools.missing_for(self.current_format().key)
+        _, missing = self.missing_tools()
         self.update_banner()
+        self.extract_panel.set_busy(busy)
+        if self.is_extract():
+            if not busy:
+                self.extract_panel.refresh_note()
+            ready = self.extract_panel.ready()
+        else:
+            ready = self._compress_ready(busy)
+        self.btn_go.setEnabled(ready and not missing and not busy)
+
+    def _compress_ready(self, busy: bool) -> bool:
+        """刷新压缩模式的输出控件和提示，返回源与输出是否可以开始压缩。"""
         has_src = bool(self.src)
         if not busy:
             self.out_input.set_note(self._output_problem())
@@ -449,10 +520,10 @@ class MainWindow(QWidget):
         else:
             src_ok = has_src and self.src_input.error is None
             out_ok = self.out_input.error is None and self.out_input.note is None
-        self.btn_go.setEnabled(src_ok and out_ok and not missing and not busy)
         # 选定源之前还没有可组合的输出路径，另存为和输出框暂不可用，避免选择被静默丢弃。
         self.btn_save.setEnabled(has_src and not busy)
         self.out_input.setEnabled(has_src and not busy)
+        return src_ok and out_ok
 
     def _output_problem(self) -> core.JobError | None:
         """对已提交的源和输出做压缩前预检，返回应在输出框下提示的问题。
@@ -470,18 +541,25 @@ class MainWindow(QWidget):
         return None
 
     def refresh_busy_ui(self) -> None:
-        """按任务和安装状态切换进度、输入控件和按钮；进度条与取消按钮只对应压缩任务。"""
+        """按任务和安装状态切换进度、输入控件和按钮；进度条与取消按钮只对应压缩或解压任务。"""
         busy = self.is_busy()
         running = self.job is not None
         self.progress.setVisible(running)
         self.btn_cancel.setEnabled(running)
-        for w in (self.src_input, self.btn_folder, self.btn_file, self.fmt_combo,
-                  self.extreme_chk):
+        for w in (self.mode_tabs, self.src_input, self.btn_folder, self.btn_file,
+                  self.fmt_combo, self.extreme_chk):
             w.setEnabled(not busy)
         self.level_slider.setEnabled(not busy and self.current_format().level is not None)
         self.update_go_state()
 
     def start(self) -> None:
+        """按当前模式开始压缩或解压。"""
+        if self.is_extract():
+            self.start_extract()
+        else:
+            self.start_compress()
+
+    def start_compress(self) -> None:
         """提交键入中的路径，预检源和输出、确认覆盖意图，捕获参数后启动后台压缩线程。"""
         # 提交新的源会重置输出命名，所以先记下输出框的草稿，源提交之后再提交它。
         out_draft = self.out_input.text() if self.out_input.pending else None
@@ -509,12 +587,41 @@ class MainWindow(QWidget):
                                         tr("overwrite_q", path=out), "replace"):
             return
         fmt = self.current_format()
-        self.job = core.ArchiveJob(
+        self._launch(core.ArchiveJob(
             self.src, out, fmt.key,
             level=self.level_slider.value() if fmt.level else None,
             extreme=self.extreme_chk.isChecked() and fmt.key == "tar.xz",
             log=self.bridge.log.emit,
-        )
+        ))
+
+    def start_extract(self) -> None:
+        """提交键入中的路径，预检归档和目标文件夹，然后启动后台解压线程。
+
+        解压绝不覆盖已有内容（重名时自动编号），所以不需要替换确认。
+        """
+        panel = self.extract_panel
+        if not panel.commit_drafts():
+            return  # 原因已显示在路径框之后
+        if panel.archive is None:
+            self.show_message(QMessageBox.Warning, tr("no_archive"))
+            return
+        if self.missing_tools()[1]:
+            return  # 草稿提交后才知道格式；缺少的工具已显示在横幅里
+        dest = panel.dest_path()
+        assert dest is not None  # 已提交归档时总有目标：选过的文件夹或归档所在的文件夹
+        try:
+            archive = core.validate_archive(panel.archive)
+            core.check_output_dir(dest)
+        except (core.JobError, OSError) as exc:
+            err = exc if isinstance(exc, core.JobError) else core.job_error_from_os(exc)
+            self.show_message(QMessageBox.Warning,
+                              tr("extract_failed", err=tr(err.key, **err.kw)))
+            return
+        self._launch(core.ExtractJob(archive, dest, log=self.bridge.log.emit))
+
+    def _launch(self, job: core.Job) -> None:
+        """在后台线程运行 job，并通知工具链控制器有任务在运行。"""
+        self.job = job
         self.t0 = time.monotonic()
         # 通知控制器任务开始，工具链窗口随之停用安装按钮，保持两者互斥。
         self.tools.set_job_running(True)
@@ -522,7 +629,7 @@ class MainWindow(QWidget):
         self._worker = threading.Thread(target=self._run_job, args=(self.job,))
         self._worker.start()
 
-    def _run_job(self, job: core.ArchiveJob) -> None:
+    def _run_job(self, job: core.Job) -> None:
         """在工作线程运行 job；通过信号传递路径或异常，不接触控件。"""
         try:
             self.bridge.done.emit(job.run(), None)
@@ -536,31 +643,46 @@ class MainWindow(QWidget):
 
     def on_job_done(self, path: Path | None, err: Exception | None) -> None:
         """在主线程处理结果；path 为成功产物，err 为失败或取消原因。退出途中只记日志不弹窗。"""
+        extract = isinstance(self.job, core.ExtractJob)
+        job = self.job
         self.job = None
         self._worker = None
         self.tools.set_job_running(False)
         if err is None:
             assert path is not None
-            msg = self._done_message(path)
+            if isinstance(job, core.ExtractJob):
+                self._log_extract_notes(job)
+            msg = self._done_message(path, extract)
             self.append_log(msg)
             if not self._quit_requested:
-                self._show_done(path, msg)
+                self._show_done(path, msg, tr("extract_done_title" if extract else "done_title"))
         elif isinstance(err, core.Cancelled):
-            self.append_log(tr("cancelled"))
+            self.append_log(tr("extract_cancelled" if extract else "cancelled"))
         else:
-            text = tr("failed", err=self._error_text(err))
+            text = tr("extract_failed" if extract else "failed", err=self._error_text(err))
             self.append_log(text)
             if not self._quit_requested:
                 self.show_message(QMessageBox.Warning, text)
         self._maybe_finish_quit()
 
-    def _done_message(self, path: Path) -> str:
-        """组合完成提示；产物在提交后被移走时省略大小，不让结果处理中途抛异常。"""
+    def _log_extract_notes(self, job: core.ExtractJob) -> None:
+        """把解压的警告（越界链接、隔离属性）写进日志。
+
+        不报告跳过的垃圾数量：大部分垃圾在工具层就被排除，事后只能数到漏网的那部分。
+        """
+        for warning in job.warnings:
+            self.append_log(tr(warning.key, **warning.kw))
+
+    def _done_message(self, path: Path, extract: bool = False) -> str:
+        """组合完成提示；压缩产物在提交后被移走时省略大小，不让结果处理中途抛异常。"""
+        secs = format_secs(time.monotonic() - self.t0)
+        if extract:
+            return tr("extract_done", path=path, secs=secs)
         try:
             size = format_size(path.stat().st_size)
         except OSError:
             size = "–"
-        return tr("done", path=path, size=size, secs=format_secs(time.monotonic() - self.t0))
+        return tr("done", path=path, size=size, secs=secs)
 
     def _error_text(self, err: Exception) -> str:
         """把任务异常转成当前语言的说明；非 JobError 属于程序缺陷，附上异常类型便于排查。"""
@@ -568,9 +690,9 @@ class MainWindow(QWidget):
             return tr(err.key, **err.kw)
         return tr("internal_error", err=f"{type(err).__name__}: {err}")
 
-    def _show_done(self, path: Path, msg: str) -> None:
+    def _show_done(self, path: Path, msg: str, title: str) -> None:
         box = QMessageBox(self)
-        box.setWindowTitle(tr("done_title"))
+        box.setWindowTitle(title)
         box.setText(msg)
         b_show = box.addButton(tr("show_in_finder"), QMessageBox.ActionRole)
         box.addButton(tr("ok"), QMessageBox.AcceptRole)
@@ -663,6 +785,8 @@ def migrate_legacy_settings(settings: QSettings, legacy: QSettings | None = None
 
 def main() -> None:
     """创建 Qt 应用，加载语言偏好并启动主事件循环。"""
+    # 从 Finder 启动时可打开文件数只有 256，解压很深的目录树需要更多（见 core.raise_fd_limit）。
+    core.raise_fd_limit()
     app = QApplication(sys.argv)
     app.setApplicationName(core.APP_NAME)
     app.setApplicationVersion(core.APP_VERSION)

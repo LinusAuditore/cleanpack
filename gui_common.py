@@ -116,10 +116,18 @@ class PathInput(QLineEdit):
         """输入框里是否有尚未提交的草稿。"""
         return self.text() != self._committed_text
 
+    @property
+    def rejected(self) -> bool:
+        """当前文字已提交但未通过校验；它和提示应留在框里，等用户修改。"""
+        return not self.pending and not self._committed_ok
+
     def focusOutEvent(self, e: QFocusEvent) -> None:
         """焦点移到窗口内其他控件时提交草稿；切换到其他应用或弹出菜单时不提交，
-        用户可能只是去 Finder 里查看名称，回来后还要继续键入。"""
+        用户可能只是去 Finder 里查看名称，回来后还要继续键入。输入框被隐藏（例如切换
+        模式）时也不提交，未完成的草稿不应替换那个模式里已经选好的路径。"""
         super().focusOutEvent(e)
+        if not self.isVisible():
+            return
         if e.reason() not in (Qt.FocusReason.ActiveWindowFocusReason,
                               Qt.FocusReason.PopupFocusReason):
             self.commit()
@@ -152,6 +160,12 @@ class PathInput(QLineEdit):
         if not self.pending and not self._committed_ok:
             self.commit()
         else:
+            self.check()
+
+    def revert(self) -> None:
+        """放弃未提交的草稿，恢复已提交的文字并重新校验提示。"""
+        if self.pending:
+            self.setText(self._committed_text)
             self.check()
 
     def submit(self, text: str) -> None:
