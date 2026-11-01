@@ -1592,6 +1592,46 @@ def rename_noreplace(src: Path, dst: Path) -> None:
 
 _QUARANTINE = "com.apple.quarantine"
 _XATTR = "/usr/bin/xattr"
+_XATTR_NOFOLLOW = 0x0001  # <sys/xattr.h>：作用于链接本身
+_PROBE_NAME = ".cleanpack-xattr-probe"
+_PROBE_ATTR = b"io.github.linusauditore.cleanpack.probe"
+
+
+def _load_setxattr() -> Callable[..., int] | None:
+    """返回 libc 的 setxattr；不是 macOS 或找不到时返回 None。"""
+    try:
+        func = ctypes.CDLL(None, use_errno=True).setxattr
+    except (OSError, AttributeError):
+        return None
+    func.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t,
+                     ctypes.c_uint32, ctypes.c_int]
+    func.restype = ctypes.c_int
+    return func
+
+
+_setxattr = _load_setxattr()
+
+
+def uses_sidecar_xattrs(directory: Path) -> bool:
+    """判断 directory 所在的卷是否只能用「._名称」文件保存扩展属性（exFAT、FAT 等）。
+
+    在 directory 里建一个探测文件并写一个属性：旁边出现 ._ 文件就说明是。不能看暂存目录里
+    有没有 ._x 来判断：系统只在进程带 com.apple.provenance 属性时才给新建的项写属性，带不带
+    取决于应用的启动方式（GitHub 的运行器上就不带）。写属性失败时返回 False，后面写隔离属性
+    的步骤会自己报告问题。探测文件和它的 ._ 文件用完即删。
+    """
+    probe = directory / _PROBE_NAME
+    sidecar = directory / ("._" + _PROBE_NAME)
+    os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    try:
+        if _setxattr is None or _setxattr(os.fsencode(probe), _PROBE_ATTR, b"1", 1, 0,
+                                          _XATTR_NOFOLLOW) != 0:
+            return False
+        return os.path.lexists(sidecar)
+    finally:
+        for path in (probe, sidecar):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
 
 
 def read_quarantine(path: Path) -> str | None:
@@ -1801,7 +1841,7 @@ class ExtractJob(Job):
             # 链接是否越界以最终放进目标文件夹的那一项为界。
             self.warnings += verify_tree(root, src if is_dir else root, self._check_cancel)
             if quarantine:
-                self._copy_quarantine(root, quarantine, staging / sidecar)
+                self._copy_quarantine(root, quarantine, staging)
             if src == root:
                 # 整个 x 改名放进目标时，exFAT 驱动会把 ._x 一起带过去，变成用户文件夹里的
                 # ._名称；提交前删掉它。
@@ -1810,10 +1850,11 @@ class ExtractJob(Job):
             self._check_cancel()
             return self._commit(src, name, is_dir)
 
-    def _copy_quarantine(self, root: Path, value: str, sidecar: Path) -> None:
+    def _copy_quarantine(self, root: Path, value: str, staging: Path) -> None:
         """把归档的隔离属性写到解出的内容上；卷只能用 ._ 文件保存属性时跳过并提示，
-        否则每个文件旁边都会多出一个 AppleDouble 文件，正是本应用要避免的垃圾。"""
-        if os.path.lexists(sidecar):
+        否则每个文件旁边都会多出一个 AppleDouble 文件，正是本应用要避免的垃圾。
+        staging 是暂存目录，与目标在同一个卷上，用来探测卷的行为。"""
+        if uses_sidecar_xattrs(staging):
             self.warnings.append(JobError("quarantine_skipped"))
         elif problem := apply_quarantine(root, value, self._run_capture, self._check_cancel):
             self.warnings.append(problem)

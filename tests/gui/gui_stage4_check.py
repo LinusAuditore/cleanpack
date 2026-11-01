@@ -60,8 +60,9 @@ def new_window() -> main.MainWindow:
 
 def fake_brew(trap: bool = False) -> str:
     script = tmp / ("brew-trap" if trap else "brew")
+    # exec：结束这个进程就结束了 sleep，不会留下孤儿进程；被忽略的 TERM 在 exec 后仍被忽略。
     script.write_text("#!/bin/sh\n" + ("trap '' TERM\n" if trap else "")
-                      + "echo installing $2\nsleep 60\n")
+                      + "echo installing $2\nexec sleep 60\n")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return str(script)
 

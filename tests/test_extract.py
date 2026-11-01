@@ -862,7 +862,9 @@ class FailureTests(ExtractBase):
         """写隔离属性的 xattr 是登记过的进程，取消时会被结束，不必等它跑完。"""
         self.require("tar")
         sleeper = self.root / "slow-xattr"
-        sleeper.write_text("#!/bin/sh\nsleep 30\n")
+        # exec：让被登记的进程就是 sleep 本身，和真实的 xattr 一样只有一个进程。否则取消只结束
+        # sh，子进程 sleep 仍占着输出管道，读输出的一方要等它睡完（较慢的机器上必现）。
+        sleeper.write_text("#!/bin/sh\nexec sleep 30\n")
         sleeper.chmod(0o755)
         path = self.tar_with("q.tar", [("top/a.txt", b"a")])
         job = core.ExtractJob(path, self.dest, log=silent)
@@ -1002,6 +1004,35 @@ class ExFatTests(ExtractBase):
         self.assertFalse([n for n in os.listdir(self.dest) if n.startswith(".cleanpack-")])
         self.assertEqual([w.key for w in job.warnings], ["quarantine_skipped"])
 
+    def test_extract_to_exfat_without_provenance(self) -> None:
+        """进程不带 com.apple.provenance 时系统不会建 ._x（GitHub 运行器上就是这样）：
+        仍要识别出这个卷只能用 ._ 文件保存属性，跳过隔离属性，不留下 ._ 文件。"""
+        self.require("tar")
+        path = self.tar_with("x.tar", [("top/a.txt", b"a"), ("top/sub/b.txt", b"b")])
+        subprocess.run(["/usr/bin/xattr", "-w", "com.apple.quarantine", "0081;1;Safari;",
+                        str(path)], check=True)
+        original = core.ExtractJob._copy_quarantine
+
+        def without_sidecar(job: core.ExtractJob, root: Path, value: str,
+                            staging: Path) -> None:
+            for name in os.listdir(staging):
+                if name.startswith("._"):
+                    os.unlink(staging / name)
+            original(job, root, value, staging)
+
+        with patch.object(core.ExtractJob, "_copy_quarantine", without_sidecar):
+            result, job, _ = self.extract(path)
+        junk = [rel for rel in nfc_tree(result) if any(core.is_junk_name(p)
+                                                       for p in rel.split("/"))]
+        self.assertEqual(junk, [])
+        self.assertEqual([w.key for w in job.warnings], ["quarantine_skipped"])
+
+    def test_sidecar_probe(self) -> None:
+        """exFAT 上探测为是，探测文件和它的 ._ 文件都不留下。"""
+        before = sorted(os.listdir(self.dest))
+        self.assertTrue(core.uses_sidecar_xattrs(self.dest))
+        self.assertEqual(sorted(os.listdir(self.dest)), before)
+
     def test_wrapper_folder_leaves_no_sidecar_on_exfat(self) -> None:
         """多个顶层项包进文件夹时，暂存目录的 ._x 不能随改名变成目标里的 ._名称。"""
         self.require("tar")
@@ -1012,6 +1043,11 @@ class ExFatTests(ExtractBase):
 
 
 class QuarantineTests(ExtractBase):
+    def test_sidecar_probe_on_apfs(self) -> None:
+        """/tmp 所在的 APFS 卷原生支持扩展属性：探测为否，不留下探测文件。"""
+        self.assertFalse(core.uses_sidecar_xattrs(self.dest))
+        self.assertEqual(os.listdir(self.dest), [])
+
     def test_quarantine_copied_without_following_links(self) -> None:
         self.require("tar")
         outside = self.root / "outside.txt"
