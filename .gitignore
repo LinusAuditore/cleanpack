@@ -22,8 +22,9 @@ htmlcov/
 /build/
 /dist/
 
-# 本地测试目录
-/tests/
+# 测试已纳入版本控制；本机偏好备份和已失效的阶段 2 夹具只留本地
+/tests/gui/prefs-backup/
+/tests/gui/gui_stage2_check.py
 
 # 本地 AI 助手说明
 /AGENTS.md
