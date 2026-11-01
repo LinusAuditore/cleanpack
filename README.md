@@ -24,7 +24,7 @@ CleanPack is a desktop archiving tool built with Python and PySide6. Select or d
 | `zip` | 0–9; 0 stores files without compression | 6 | `zip` |
 | `7z` | 0–9; 0 stores files without compression | 5 | `7zz`, with fallback to `7z` |
 
-zstd levels 20–22 enable `--ultra` and use substantially more memory. Switching formats resets the compression level to that format's default.
+zstd levels 20–22 enable `--ultra` and use substantially more memory. Switching formats resets the compression level to that format's default and turns off xz extreme mode.
 
 ## Run from source
 
@@ -86,15 +86,18 @@ Each task creates its own `.cleanpack-*.part/` temporary directory in the output
 
 ```text
 main.py             GUI, task coordination, and tool installation
+gui_common.py       Shared Qt helpers: localized number formats and dialogs
 core.py             Archiving core, independent of Qt
 i18n.py             Interface strings in four languages
 requirements.txt    Runtime dependencies
 CleanPack.spec      PyInstaller build configuration
 icon.icns           macOS app icon
 LICENSE             BSD 2-Clause license
+licenses/           Third-party license texts bundled with the macOS app
 ```
 
 ## License
 
 Copyright 2026 Xinghao Zuo. Licensed under the [BSD 2-Clause License](LICENSE)
-(SPDX: `BSD-2-Clause`). Third-party dependencies retain their respective licenses.
+(SPDX: `BSD-2-Clause`). Third-party dependencies retain their respective licenses; see
+[licenses/THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md) for the components bundled in the macOS app.

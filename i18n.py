@@ -4,9 +4,21 @@ from __future__ import annotations
 LANGS = [("en", "English"), ("zh_Hans", "简体中文"),
          ("zh_Hant", "繁體中文"), ("fr", "Français")]
 
+# 界面语言对应的 Qt 区域名，用于数字格式和 Qt 自带文案，不随系统区域设置变化。
+QT_LOCALES = {"en": "en_US", "zh_Hans": "zh_CN", "zh_Hant": "zh_TW", "fr": "fr_FR"}
+
 STRINGS: dict[str, dict[str, str]] = {
     "en": {
         "zip_invalid": "The ZIP filename metadata is invalid.",
+        "tool_start_failed": "Could not start {tool}: {err}",
+        "no_space": "There isn't enough free disk space.",
+        "read_only": "This location is on a read-only volume: {path}",
+        "access_denied": "CleanPack doesn't have permission to access {path}.",
+        "not_found": "This item could not be found: {path}",
+        "out_is_dir": "The output path is an existing folder: {path}",
+        "io_error": "A file operation failed: {err}",
+        "out_dir_missing": "The output folder doesn't exist: {path}",
+        "out_dir_not_dir": "The output location isn't a folder: {path}",
         "out_same_src": "The output must not replace the source file.",
         "install_start_fail": "Could not start Homebrew: {err}",
         "replace": "Replace",
@@ -45,7 +57,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "log": "Log",
         "no_source": "Choose a file or folder first.",
         "missing_tools": "{fmt} needs: {tools}. Install them in Toolchain below.",
-        "done": "Compressed: {path} ({size}, {secs:.1f}s)",
+        "done": "Compressed: {path} ({size}, {secs}s)",
         "done_title": "Compressed",
         "failed": "Compression failed: {err}",
         "cancelled": "Compression cancelled.",
@@ -66,9 +78,28 @@ STRINGS: dict[str, dict[str, str]] = {
         "show_in_finder": "Show in Finder",
         "out_inside_src": "The output file can't be inside the folder being compressed.",
         "tool_failed": "{tool} exited with code {code}.",
+        "tools_not_brew": "{tools} comes with macOS and can't be installed with Homebrew.",
+        "install_cancelled": "Installation cancelled.",
+        "size_bytes": "{n} bytes",
+        "install_crashed": "Homebrew stopped unexpectedly.",
+        "internal_error": "An unexpected error occurred: {err}",
+        "quit_title": "Quit {app}?",
+        "quit_job_q": "A task is still running. Stop it and quit?",
+        "quit_install_q": "Homebrew is still installing tools. Stop the installation and quit?",
+        "stop_quit": "Stop and Quit",
+        "quitting": "Stopping the current task before quitting…",
     },
     "zh_Hans": {
         "zip_invalid": "ZIP 文件名元数据无效。",
+        "tool_start_failed": "无法启动 {tool}：{err}",
+        "no_space": "磁盘空间不足。",
+        "read_only": "该位置位于只读卷上：{path}",
+        "access_denied": "CleanPack 没有权限访问 {path}。",
+        "not_found": "找不到该项目：{path}",
+        "out_is_dir": "输出路径是一个已有的文件夹：{path}",
+        "io_error": "文件操作失败：{err}",
+        "out_dir_missing": "输出文件夹不存在：{path}",
+        "out_dir_not_dir": "输出位置不是文件夹：{path}",
         "out_same_src": "输出文件不能覆盖源文件。",
         "install_start_fail": "无法启动 Homebrew：{err}",
         "replace": "替换",
@@ -107,7 +138,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "log": "日志",
         "no_source": "请先选择文件或文件夹。",
         "missing_tools": "{fmt} 需要：{tools}。可在下方“工具链”中安装。",
-        "done": "已压缩：{path}（{size}，用时 {secs:.1f} 秒）",
+        "done": "已压缩：{path}（{size}，用时 {secs} 秒）",
         "done_title": "已压缩",
         "failed": "压缩失败：{err}",
         "cancelled": "已取消压缩。",
@@ -128,9 +159,28 @@ STRINGS: dict[str, dict[str, str]] = {
         "show_in_finder": "在访达中显示",
         "out_inside_src": "输出文件不能放在要压缩的文件夹里。",
         "tool_failed": "{tool} 退出码 {code}。",
+        "tools_not_brew": "{tools} 随 macOS 提供，无法用 Homebrew 安装。",
+        "install_cancelled": "已取消安装。",
+        "size_bytes": "{n} 字节",
+        "install_crashed": "Homebrew 意外中止。",
+        "internal_error": "发生意外错误：{err}",
+        "quit_title": "退出 {app}？",
+        "quit_job_q": "任务仍在进行。要停止任务并退出吗？",
+        "quit_install_q": "Homebrew 仍在安装工具。要停止安装并退出吗？",
+        "stop_quit": "停止并退出",
+        "quitting": "正在停止当前任务，随后退出…",
     },
     "zh_Hant": {
         "zip_invalid": "ZIP 檔案名稱中繼資料無效。",
+        "tool_start_failed": "無法啟動 {tool}：{err}",
+        "no_space": "磁碟空間不足。",
+        "read_only": "此位置位於唯讀卷宗上：{path}",
+        "access_denied": "CleanPack 沒有權限取用 {path}。",
+        "not_found": "找不到此項目：{path}",
+        "out_is_dir": "輸出路徑是既有的資料夾：{path}",
+        "io_error": "檔案操作失敗：{err}",
+        "out_dir_missing": "輸出資料夾不存在：{path}",
+        "out_dir_not_dir": "輸出位置不是資料夾：{path}",
         "out_same_src": "輸出檔案不能覆蓋來源檔案。",
         "install_start_fail": "無法啟動 Homebrew：{err}",
         "replace": "取代",
@@ -169,7 +219,7 @@ STRINGS: dict[str, dict[str, str]] = {
         "log": "紀錄",
         "no_source": "請先選擇檔案或資料夾。",
         "missing_tools": "{fmt} 需要：{tools}。可在下方「工具鏈」中安裝。",
-        "done": "已壓縮：{path}（{size}，耗時 {secs:.1f} 秒）",
+        "done": "已壓縮：{path}（{size}，耗時 {secs} 秒）",
         "done_title": "已壓縮",
         "failed": "壓縮失敗：{err}",
         "cancelled": "已取消壓縮。",
@@ -190,9 +240,28 @@ STRINGS: dict[str, dict[str, str]] = {
         "show_in_finder": "在 Finder 中顯示",
         "out_inside_src": "輸出檔案不能放在要壓縮的資料夾裡。",
         "tool_failed": "{tool} 結束代碼 {code}。",
+        "tools_not_brew": "{tools} 隨 macOS 提供，無法用 Homebrew 安裝。",
+        "install_cancelled": "已取消安裝。",
+        "size_bytes": "{n} 位元組",
+        "install_crashed": "Homebrew 意外中止。",
+        "internal_error": "發生未預期的錯誤：{err}",
+        "quit_title": "要結束 {app} 嗎？",
+        "quit_job_q": "工作仍在進行中。要停止工作並結束嗎？",
+        "quit_install_q": "Homebrew 仍在安裝工具。要停止安裝並結束嗎？",
+        "stop_quit": "停止並結束",
+        "quitting": "正在停止目前的工作，之後結束…",
     },
     "fr": {
         "zip_invalid": "Les métadonnées des noms de fichiers ZIP sont invalides.",
+        "tool_start_failed": "Impossible de démarrer {tool} : {err}",
+        "no_space": "L’espace disque disponible est insuffisant.",
+        "read_only": "Cet emplacement se trouve sur un volume en lecture seule : {path}",
+        "access_denied": "CleanPack n’a pas l’autorisation d’accéder à {path}.",
+        "not_found": "Élément introuvable : {path}",
+        "out_is_dir": "Le chemin de sortie est un dossier existant : {path}",
+        "io_error": "Une opération sur les fichiers a échoué : {err}",
+        "out_dir_missing": "Le dossier de sortie n’existe pas : {path}",
+        "out_dir_not_dir": "L’emplacement de sortie n’est pas un dossier : {path}",
         "out_same_src": "Le fichier de sortie ne doit pas remplacer le fichier source.",
         "install_start_fail": "Impossible de démarrer Homebrew : {err}",
         "replace": "Remplacer",
@@ -229,30 +298,40 @@ STRINGS: dict[str, dict[str, str]] = {
         "compress": "Compresser",
         "cancel": "Annuler",
         "log": "Journal",
-        "no_source": "Choisissez d'abord un fichier ou un dossier.",
+        "no_source": "Choisissez d’abord un fichier ou un dossier.",
         "missing_tools": "{fmt} nécessite : {tools}. Installez-les dans Outils ci-dessous.",
-        "done": "Compressé : {path} ({size}, {secs:.1f} s)",
+        "done": "Compressé : {path} ({size}, {secs} s)",
         "done_title": "Compressé",
         "failed": "Échec de la compression : {err}",
         "cancelled": "Compression annulée.",
         "overwrite_title": "Le fichier existe déjà",
         "overwrite_q": "{path} existe déjà. Le remplacer ?",
         "brew_dlg_title": "Homebrew introuvable",
-        "brew_dlg_text": ("Homebrew n'a pas été détecté. tar, tar.gz et zip fonctionnent avec "
+        "brew_dlg_text": ("Homebrew n’a pas été détecté. tar, tar.gz et zip fonctionnent avec "
                           "les outils intégrés, mais tar.xz, tar.zst et 7z nécessitent des outils "
                           "supplémentaires fournis par Homebrew.\n\n"
                           "Pour installer Homebrew, exécutez ceci dans le Terminal :"),
         "open_site": "Ouvrir brew.sh",
-        "copy_install": "Copier la commande d'installation",
+        "copy_install": "Copier la commande d’installation",
         "continue": "Continuer",
         "copied": "Copié dans le presse-papiers.",
         "installing": "Exécution : {cmd}",
         "install_ok": "Installation terminée.",
-        "install_fail": "Échec de l'installation (code {code}).",
+        "install_fail": "Échec de l’installation (code {code}).",
         "nothing_missing": "Tous les outils sont installés.",
         "show_in_finder": "Afficher dans le Finder",
         "out_inside_src": "Le fichier de sortie ne peut pas se trouver dans le dossier compressé.",
-        "tool_failed": "{tool} s'est terminé avec le code {code}.",
+        "tool_failed": "{tool} s’est terminé avec le code {code}.",
+        "tools_not_brew": "{tools} est fourni avec macOS et ne peut pas être installé avec Homebrew.",
+        "install_cancelled": "Installation annulée.",
+        "size_bytes": "{n} octets",
+        "install_crashed": "Homebrew s’est arrêté de façon inattendue.",
+        "internal_error": "Une erreur inattendue s’est produite : {err}",
+        "quit_title": "Quitter {app} ?",
+        "quit_job_q": "Une tâche est en cours. L’arrêter et quitter ?",
+        "quit_install_q": "Homebrew installe encore des outils. Arrêter l’installation et quitter ?",
+        "stop_quit": "Arrêter et quitter",
+        "quitting": "Arrêt de la tâche en cours avant de quitter…",
     },
 }
 
@@ -276,14 +355,24 @@ def tr(key: str, **kw: object) -> str:
 
 def detect_lang(locale_names: list[str]) -> str:
     """按 locale_names 的优先顺序返回支持的语言代码；无匹配时回退英文。"""
-    for n in locale_names:
-        n = n.replace("_", "-").lower()
-        if n.startswith("zh"):
-            if "hant" in n or any(r in n for r in ("-tw", "-hk", "-mo")):
+    for name in locale_names:
+        # 去掉 POSIX 形式的编码和修饰（zh_TW.UTF-8、sr@latin）。
+        name = name.split(".")[0].split("@")[0]
+        # 按子标签精确比较：前缀匹配会把 frr（北弗里西语）误判为法语。
+        lang, *subtags = name.replace("_", "-").lower().split("-")
+        # 单字母子标签（-u-、-x-）之后是扩展，例如 u-nu-hans 是数字系统，不是文字。
+        rest = []
+        for tag in subtags:
+            if len(tag) == 1:
+                break
+            rest.append(tag)
+        if lang == "zh":
+            # 脚本子标签优先于地区，zh-Hans-HK 是香港使用的简体中文。
+            if "hans" in rest:
+                return "zh_Hans"
+            if "hant" in rest or {"tw", "hk", "mo"} & set(rest):
                 return "zh_Hant"
             return "zh_Hans"
-        if n.startswith("fr"):
-            return "fr"
-        if n.startswith("en"):
-            return "en"
+        if lang in ("fr", "en"):
+            return lang
     return "en"

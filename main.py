@@ -7,9 +7,9 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import (QLocale, QObject, QProcess, QProcessEnvironment,
-                            QSettings, Qt, QTimer, QUrl, Signal)
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent, QGuiApplication
+from PySide6.QtCore import QLocale, QObject, QProcess, QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent,
+                           QGuiApplication)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QMessageBox, QPlainTextEdit,
@@ -17,25 +17,11 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                                QWidget)
 
 import core
+from gui_common import confirm, format_secs, format_size, process_environment
 from i18n import LANGS, current_lang, detect_lang, set_lang, tr
 
-
-def human_size(n: int) -> str:
-    """将字节数 n 转成适合完成提示的大小字符串。"""
-    size = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.2f} {unit}"
-        size /= 1024
-    raise AssertionError("unreachable")
-
-
-def process_environment() -> QProcessEnvironment:
-    """把核心层的统一子进程环境转换为 Qt 环境，保持 Finder 启动行为一致。"""
-    env = QProcessEnvironment()
-    for key, value in core.ENV.items():
-        env.insert(key, value)
-    return env
+# 首次启动时的默认格式：只用 macOS 自带工具即可完成，不会一打开就提示缺少工具。
+DEFAULT_FORMAT = "zip"
 
 
 class Bridge(QObject):
@@ -54,9 +40,14 @@ class MainWindow(QWidget):
         self.out_dir: Path | None = None
         self.out_stem: str | None = None
         self.job: core.ArchiveJob | None = None
+        self._worker: threading.Thread | None = None
         self.proc: QProcess | None = None
         self._proc_buffer = ""
         self._proc_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._install_cancelled = False
+        self._quit_requested = False
+        self._quit_ready = False
+        self._last_fmt: str | None = None
         self.t0 = 0.0
         self.brew: str | None = None
         self.tool_paths: dict[str, str | None] = {}
@@ -129,7 +120,7 @@ class MainWindow(QWidget):
         self.fmt_combo = QComboBox()
         for key in core.FORMATS:
             self.fmt_combo.addItem(key, key)
-        last = self.settings.value("format", "tar.zst")
+        last = self.settings.value("format", DEFAULT_FORMAT)
         if last in core.FORMATS:
             self.fmt_combo.setCurrentIndex(list(core.FORMATS).index(last))
         self.fmt_combo.currentIndexChanged.connect(self.on_format_changed)
@@ -193,6 +184,7 @@ class MainWindow(QWidget):
         tv.addLayout(grid)
         self.cmd_edit = QLineEdit()
         self.cmd_edit.setReadOnly(True)
+        self.cmd_edit.setAcceptDrops(False)
         tv.addWidget(self.cmd_edit)
         hb = QHBoxLayout()
         self.btn_install = QPushButton()
@@ -287,6 +279,10 @@ class MainWindow(QWidget):
         """应用当前格式的级别范围及默认值，并同步输出扩展名。"""
         fmt = self.current_format()
         self.settings.setValue("format", fmt.key)
+        if fmt.key != self._last_fmt:
+            # 切换格式时恢复该格式的默认设置，极限模式也一并关闭。
+            self.extreme_chk.setChecked(False)
+            self._last_fmt = fmt.key
         has_level = fmt.level is not None
         for w in (self.level_slider, self.fast_lbl, self.small_lbl, self.level_val):
             w.setEnabled(has_level)
@@ -381,14 +377,26 @@ class MainWindow(QWidget):
         for key, (status, used, path_lbl) in self.tool_rows.items():
             tool, p = core.TOOLS[key], self.tool_paths.get(key)
             text = f"✅ {tr('tool_ok')}" if p else f"❌ {tr('tool_missing')}"
-            if p and tool.builtin:
+            # 按实际路径判断是否系统自带：PATH 中 Homebrew 目录在前时可能找到 Homebrew 的版本。
+            if p and core.is_system_path(p):
                 text += f" ({tr('system_tool')})"
             status.setText(text)
             used.setText(tr("used_by", fmts=", ".join(core.formats_using(key))))
-            path_lbl.setText(p or (f"brew install {tool.formula}" if tool.formula else ""))
+            if p:
+                path_lbl.setText(p)
+            elif tool.formula:
+                path_lbl.setText(f"brew install {tool.formula}")
+            else:
+                path_lbl.setText(tr("tools_not_brew", tools=key))
         formulas = core.missing_formulas(self.tool_paths)
-        self.cmd_edit.setText("brew install " + " ".join(formulas) if formulas
-                              else tr("nothing_missing"))
+        # 没有 formula 的工具（例如 tar）缺失时无法安装，不能显示“所有工具均已安装”。
+        unfixable = [k for k, p in self.tool_paths.items() if not p and not core.TOOLS[k].formula]
+        if formulas:
+            self.cmd_edit.setText("brew install " + " ".join(formulas))
+        elif unfixable:
+            self.cmd_edit.setText(tr("tools_not_brew", tools=", ".join(unfixable)))
+        else:
+            self.cmd_edit.setText(tr("nothing_missing"))
         busy = self.job is not None or self.proc is not None
         self.btn_install.setEnabled(bool(formulas and self.brew) and not busy)
         self.btn_copy.setEnabled(bool(formulas))
@@ -409,6 +417,7 @@ class MainWindow(QWidget):
         self.proc.errorOccurred.connect(self._install_error)
         self._proc_buffer = ""
         self._proc_decoder.reset()
+        self._install_cancelled = False
         self.append_log(tr("installing", cmd="brew install " + " ".join(formulas)))
         self.set_busy(True)
         self.proc.start(self.brew, ["install", *formulas])
@@ -429,11 +438,20 @@ class MainWindow(QWidget):
         if error == QProcess.FailedToStart and self.proc is not None:
             self.append_log(tr("install_start_fail", err=self.proc.errorString()))
             self._finish_install()
+            self._maybe_finish_quit()
 
-    def _install_finished(self, code: int, _status: QProcess.ExitStatus) -> None:
-        """根据退出码记录安装结果并统一释放进程。"""
+    def _install_finished(self, code: int, status: QProcess.ExitStatus) -> None:
+        """记录安装结果并统一释放进程；用户取消和意外中止分别说明，不当作普通失败。"""
         self._finish_install()
-        self.append_log(tr("install_ok") if code == 0 else tr("install_fail", code=code))
+        if self._install_cancelled:
+            self.append_log(tr("install_cancelled"))
+        elif status == QProcess.CrashExit:
+            self.append_log(tr("install_crashed"))
+        elif code == 0:
+            self.append_log(tr("install_ok"))
+        else:
+            self.append_log(tr("install_fail", code=code))
+        self._maybe_finish_quit()
 
     def _finish_install(self) -> None:
         """排空剩余日志、释放 QProcess，然后恢复按钮并重新检测工具。"""
@@ -448,6 +466,20 @@ class MainWindow(QWidget):
         self.proc = None
         self.set_busy(False)
         self.refresh_tools()
+
+    def _cancel_install(self) -> None:
+        """先请求 brew 正常退出以便它自行清理，5 秒后仍在运行再强制终止。"""
+        proc = self.proc
+        if proc is None:
+            return
+        self._install_cancelled = True
+        proc.terminate()
+        QTimer.singleShot(5000, lambda: self._kill_if_running(proc))
+
+    def _kill_if_running(self, proc: QProcess) -> None:
+        # 安装结束后 self.proc 会被清空，只有仍是当前进程时才强制终止，避免操作已释放的对象。
+        if self.proc is proc:
+            proc.kill()
 
     def check_brew_on_start(self) -> None:
         """缺少 Homebrew 时提供官网和安装命令，不自动执行安装脚本。"""
@@ -472,23 +504,33 @@ class MainWindow(QWidget):
         self.append_log(tr("copied"))
 
     # ---------------- 压缩 ----------------
+    def is_busy(self) -> bool:
+        return self.job is not None or self.proc is not None
+
     def update_go_state(self) -> None:
-        """根据输入、工具缺失和忙碌状态决定压缩按钮及警告内容。"""
-        busy = self.job is not None or self.proc is not None
+        """根据输入、工具缺失和忙碌状态决定压缩按钮、输出控件及警告内容。"""
+        busy = self.is_busy()
         missing = core.missing_tools(self.current_format().key, self.tool_paths)
-        if missing:
+        if missing and not any(core.TOOLS[t].formula for t in missing):
+            # 缺的都是 macOS 自带、无法用 Homebrew 安装的工具，不能再提示去工具链安装。
+            self.warn_lbl.setText(tr("tools_not_brew", tools=", ".join(missing)))
+        elif missing:
             self.warn_lbl.setText(tr("missing_tools", fmt=self.current_format().key,
                                      tools=", ".join(missing)))
         else:
             self.warn_lbl.setText("")
-        self.btn_go.setEnabled(bool(self.src) and not missing and not busy)
+        has_src = bool(self.src)
+        self.btn_go.setEnabled(has_src and not missing and not busy)
+        # 选定源之前还没有可组合的输出路径，另存为和输出框暂不可用，避免选择被静默丢弃。
+        self.btn_save.setEnabled(has_src and not busy)
+        self.out_edit.setEnabled(has_src and not busy)
 
     def set_busy(self, busy: bool) -> None:
         """根据 busy 切换进度和输入控件，结束后恢复当前格式的限制。"""
         self.progress.setVisible(busy)
         self.btn_cancel.setEnabled(busy)
-        for w in (self.btn_folder, self.btn_file, self.btn_save, self.fmt_combo,
-                  self.level_slider, self.extreme_chk, self.out_edit):
+        for w in (self.btn_folder, self.btn_file, self.fmt_combo,
+                  self.level_slider, self.extreme_chk):
             w.setEnabled(not busy)
         if not busy:
             self.on_format_changed_enable_only()
@@ -499,21 +541,21 @@ class MainWindow(QWidget):
         self.level_slider.setEnabled(self.current_format().level is not None)
 
     def start(self) -> None:
-        """确认已有输出的覆盖意图，捕获参数后启动后台压缩线程。"""
+        """预检输出位置、确认覆盖意图，捕获参数后启动后台压缩线程。"""
         if not self.src:
-            self.show_message(QMessageBox.Information, tr("no_source"))
+            self.show_message(QMessageBox.Warning, tr("no_source"))
             return
-        out = Path(self.out_edit.text()).expanduser()
-        if out.exists():
-            box = QMessageBox(QMessageBox.Question, tr("overwrite_title"),
-                              tr("overwrite_q", path=out), parent=self)
-            yes = box.addButton(tr("replace"), QMessageBox.YesRole)
-            no = box.addButton(tr("cancel"), QMessageBox.NoRole)
-            box.setDefaultButton(no)
-            box.setEscapeButton(no)
-            box.exec()
-            if box.clickedButton() is not yes:
-                return
+        out = Path(self.out_edit.text()).expanduser().absolute()
+        # 先检查输出位置，避免用户确认替换后才发现目录不可写或输出会覆盖源文件。
+        try:
+            core.check_compress_output(self.src.absolute(), out)
+        except (core.JobError, OSError) as exc:
+            err = exc if isinstance(exc, core.JobError) else core.job_error_from_os(exc)
+            self.show_message(QMessageBox.Warning, tr("failed", err=tr(err.key, **err.kw)))
+            return
+        if out.exists() and not confirm(self, tr("overwrite_title"),
+                                        tr("overwrite_q", path=out), "replace"):
+            return
         fmt = self.current_format()
         self.job = core.ArchiveJob(
             self.src, out, fmt.key,
@@ -523,7 +565,9 @@ class MainWindow(QWidget):
         )
         self.t0 = time.monotonic()
         self.set_busy(True)
-        threading.Thread(target=self._run_job, args=(self.job,), daemon=True).start()
+        # 非守护线程：退出流程会先取消任务并等待它结束，保证子进程和暂存目录被清理。
+        self._worker = threading.Thread(target=self._run_job, args=(self.job,))
+        self._worker.start()
 
     def _run_job(self, job: core.ArchiveJob) -> None:
         """在工作线程运行 job；通过信号传递路径或异常，不接触控件。"""
@@ -537,31 +581,51 @@ class MainWindow(QWidget):
         if self.job:
             self.job.cancel()
         if self.proc:
-            self.proc.kill()
+            self._cancel_install()
 
     def on_job_done(self, path: Path | None, err: Exception | None) -> None:
-        """在主线程处理结果；path 为成功产物，err 为失败或取消原因。"""
+        """在主线程处理结果；path 为成功产物，err 为失败或取消原因。退出途中只记日志不弹窗。"""
         self.job = None
+        self._worker = None
         self.set_busy(False)
         if err is None:
             assert path is not None
-            msg = tr("done", path=path, size=human_size(path.stat().st_size),
-                     secs=time.monotonic() - self.t0)
+            msg = self._done_message(path)
             self.append_log(msg)
-            box = QMessageBox(self)
-            box.setWindowTitle(tr("done_title"))
-            box.setText(msg)
-            b_show = box.addButton(tr("show_in_finder"), QMessageBox.ActionRole)
-            box.addButton(tr("ok"), QMessageBox.AcceptRole)
-            box.exec()
-            if box.clickedButton() is b_show:
-                self.show_in_finder(path)
+            if not self._quit_requested:
+                self._show_done(path, msg)
         elif isinstance(err, core.Cancelled):
             self.append_log(tr("cancelled"))
         else:
-            text = tr(err.key, **err.kw) if isinstance(err, core.JobError) else str(err)
-            self.append_log(tr("failed", err=text))
-            self.show_message(QMessageBox.Warning, tr("failed", err=text))
+            text = tr("failed", err=self._error_text(err))
+            self.append_log(text)
+            if not self._quit_requested:
+                self.show_message(QMessageBox.Warning, text)
+        self._maybe_finish_quit()
+
+    def _done_message(self, path: Path) -> str:
+        """组合完成提示；产物在提交后被移走时省略大小，不让结果处理中途抛异常。"""
+        try:
+            size = format_size(path.stat().st_size)
+        except OSError:
+            size = "–"
+        return tr("done", path=path, size=size, secs=format_secs(time.monotonic() - self.t0))
+
+    def _error_text(self, err: Exception) -> str:
+        """把任务异常转成当前语言的说明；非 JobError 属于程序缺陷，附上异常类型便于排查。"""
+        if isinstance(err, core.JobError):
+            return tr(err.key, **err.kw)
+        return tr("internal_error", err=f"{type(err).__name__}: {err}")
+
+    def _show_done(self, path: Path, msg: str) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle(tr("done_title"))
+        box.setText(msg)
+        b_show = box.addButton(tr("show_in_finder"), QMessageBox.ActionRole)
+        box.addButton(tr("ok"), QMessageBox.AcceptRole)
+        box.exec()
+        if box.clickedButton() is b_show:
+            self.show_in_finder(path)
 
     def show_in_finder(self, path: Path) -> None:
         """异步用 open -R 在 Finder 中选中 path，避免 Finder 响应慢时阻塞窗口。"""
@@ -583,14 +647,79 @@ class MainWindow(QWidget):
     def append_log(self, line: str) -> None:
         self.log_view.appendPlainText(line)
 
+    # ---------------- 退出 ----------------
+    def closeEvent(self, e: QCloseEvent) -> None:
+        """任务或安装进行中时先确认，再取消并等它结束后关闭，不留下孤立进程和暂存文件。"""
+        if self._quit_ready or not self.is_busy():
+            e.accept()
+            return
+        e.ignore()
+        if self._quit_requested:
+            return
+        question = tr("quit_job_q") if self.job else tr("quit_install_q")
+        if not confirm(self, tr("quit_title", app=core.APP_NAME), question, "stop_quit"):
+            return
+        self._quit_requested = True
+        self.append_log(tr("quitting"))
+        self.cancel()
+        # 确认框打开期间任务可能已经结束，此时没有完成回调会再来触发关闭，需要在这里检查一次。
+        self._maybe_finish_quit()
+
+    def _maybe_finish_quit(self) -> None:
+        """退出请求已确认且任务和安装都已结束时，真正关闭窗口。"""
+        if self._quit_requested and not self.is_busy():
+            self._quit_ready = True
+            QTimer.singleShot(0, self.close)
+
+    def shutdown(self) -> None:
+        """应用退出前的最后防线：取消任务并等待工作线程，结束仍在运行的安装进程。"""
+        if self.job is not None:
+            self.job.cancel()
+        if self._worker is not None:
+            self._worker.join(10)
+        if self.proc is not None:
+            self.proc.kill()
+            self.proc.waitForFinished(2000)
+
+
+def settings_scope(bundle_id: str) -> tuple[str, str]:
+    """把 bundle id 拆成 QSettings 的 (组织域名, 应用名)。
+
+    macOS 上 Qt 会把组织域名倒序后接上应用名作为偏好域，得到的正是 bundle id，
+    这样应用偏好与系统为该 bundle 保存的面板状态位于同一个 plist。
+    """
+    *org, app = bundle_id.split(".")
+    return ".".join(reversed(org)), app
+
+
+def migrate_legacy_settings(settings: QSettings, legacy: QSettings | None = None) -> None:
+    """首次使用新偏好域时，从旧域复制语言和格式；旧文件保留不删。
+
+    legacy 默认是旧版本使用的 com.cleanpack.CleanPack，测试时可传入临时设置。
+    """
+    if settings.value("prefs_version") is not None:
+        return
+    if legacy is None:
+        # 旧偏好域是历史事实，写死名称；以后即使修改 APP_NAME 也仍能找到老用户的设置。
+        legacy = QSettings("CleanPack", "CleanPack")
+    for key in ("lang", "format"):
+        value = legacy.value(key)
+        if value is not None and settings.value(key) is None:
+            settings.setValue(key, value)
+    settings.setValue("prefs_version", 1)
+    settings.sync()
+
 
 def main() -> None:
     """创建 Qt 应用，加载语言偏好并启动主事件循环。"""
     app = QApplication(sys.argv)
     app.setApplicationName(core.APP_NAME)
-    settings = QSettings(core.APP_NAME, core.APP_NAME)
+    app.setApplicationVersion(core.APP_VERSION)
+    settings = QSettings(*settings_scope(core.BUNDLE_ID))
+    migrate_legacy_settings(settings)
     set_lang(settings.value("lang") or detect_lang(QLocale.system().uiLanguages()))
     w = MainWindow(settings)
+    app.aboutToQuit.connect(w.shutdown)
     w.resize(780, 760)
     w.show()
     sys.exit(app.exec())
