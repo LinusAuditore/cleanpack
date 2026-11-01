@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import errno
 import fnmatch
+import hashlib
 import itertools
 import os
 import re
@@ -18,7 +19,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 import urllib.parse
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterator
@@ -126,10 +129,19 @@ def formats_using(tool_key: str) -> list[str]:
     return [f.key for f in FORMATS.values() if tool_key in f.tools]
 
 
-def missing_tools(fmt_key: str, paths: dict[str, str | None] | None = None) -> list[str]:
-    """返回指定格式缺少的工具；paths 可提供已检测结果，未提供的项现场检测。"""
+def compress_tools(fmt_key: str, encrypted: bool = False) -> tuple[str, ...]:
+    """返回压缩该格式必需的工具；加密 zip 改用系统 tar（bsdtar），见 ArchiveJob._run_zip_encrypted。"""
+    if encrypted and fmt_key == "zip":
+        return ("tar",)
+    return FORMATS[fmt_key].tools
+
+
+def missing_tools(fmt_key: str, paths: dict[str, str | None] | None = None,
+                  encrypted: bool = False) -> list[str]:
+    """返回指定格式缺少的工具；paths 可提供已检测结果，未提供的项现场检测。
+    encrypted 表示要加密，加密 zip 需要的工具与普通 zip 不同。"""
     paths = paths or {}
-    return [t for t in FORMATS[fmt_key].tools
+    return [t for t in compress_tools(fmt_key, encrypted)
             if not (paths.get(t) if t in paths else locate(t))]
 
 
@@ -184,6 +196,38 @@ def _is_bsdtar(tar: str) -> bool:
 
 class Cancelled(Exception):
     """用户取消任务；GUI 将其显示为正常取消而非压缩失败。"""
+
+
+# ---------- 加密 ----------
+# 只有 zip 和 7z 有通用的标准加密方式；tar 系列没有，界面上停用加密选项。
+ENCRYPTABLE = ("zip", "7z")
+# zip 的加密方式，取值即 bsdtar 的 zip:encryption 参数；第一个是默认值。ZipCrypto 很容易被
+# 破解，只为兼容只认传统加密的解压工具而保留。
+ZIP_METHODS = ("aes256", "zipcrypt")
+# 生成归档时的密码长度上限（字符数）。7-Zip 解 WinZip AES 的 zip 时拒绝超过 99 字节的密码
+# （实测 100 个字符即报错）；统一取 99，保证生成的归档换个工具也能打开。
+PASSWORD_MAX = 99
+# 解压时的上限：别人的归档可能用了更长的密码。bsdtar 读密码的缓冲区是 1024 字节，
+# 255 个字符即使每个占 4 字节也放得下，更长的会被悄悄截断。
+EXTRACT_PASSWORD_MAX = 255
+
+
+def check_password(password: str, fmt_key: str | None) -> None:
+    """校验密码，不合格时抛出 JobError（错误参数里不含密码本身）。fmt_key 是要生成的格式；
+    解压时为 None，只检查长度和控制字符，因为别人的归档可能用了非 ASCII 密码。
+
+    密码经标准输入按行交给工具，所以不能含换行等控制字符。zip 对非 ASCII 密码没有统一的
+    编码约定，换个解压工具可能就打不开，生成 zip 时只允许可打印 ASCII；7z 按 Unicode 处理密码。
+    """
+    if not password:
+        raise JobError("password_empty")
+    limit = EXTRACT_PASSWORD_MAX if fmt_key is None else PASSWORD_MAX
+    if len(password) > limit:
+        raise JobError("password_too_long", max=limit)
+    if any(unicodedata.category(c) in ("Cc", "Cs") for c in password):
+        raise JobError("password_invalid_char")
+    if fmt_key == "zip" and not all(" " <= c <= "~" for c in password):
+        raise JobError("password_not_ascii")
 
 
 class JobError(Exception):
@@ -489,19 +533,154 @@ def extract_family(path: Path) -> str:
     return _FAMILY_OF_FORMAT[fmt]
 
 
-def zip_is_encrypted(path: Path) -> bool:
-    """zip 中是否有加密的成员（通用标志位 bit 0，传统加密和 AES 都会设置）；读不了时返回 False。
+_BSDTAR_DECRYPTABLE = (0, 8)  # libarchive 能解密后再解压的方法：存储、deflate
 
-    必须事先判断：传统 ZipCrypto 只用一个校验字节验证密码，bsdtar 拿任何假密码去试，
-    约有 1/256 的机会被当成正确密码，随后解出乱码并报 CRC 错误，而不是“需要密码”。
+
+def zip_encryption(path: Path, check: Callable[[], None] | None = None) -> tuple[bool, bool] | None:
+    """返回 (是否有加密的成员, 是否需要交给 7-Zip)；中央目录读不了时返回 None。
+    check 用于响应取消（要逐个读本地头，成员很多又在慢速卷上时需要一些时间）。
+
+    加密看通用标志位 bit 0（传统加密和 AES 都会设置），中央目录和本地头任一处标明即算，
+    见 _encrypted_entries。必须事先判断：传统 ZipCrypto 只用
+    一个校验字节验证密码，bsdtar 拿任何假密码去试，约有 1/256 的机会被当成正确密码，
+    随后解出乱码并报 CRC 错误，而不是“需要密码”。
+
+    以下加密成员 bsdtar 处理不了，归档要交给 7-Zip：
+    - 符号链接（7-Zip 加 -snl 时会生成）：AES 的直接报错，传统加密的却把密文当成链接目标
+      写出来并报告成功；
+    - 存储和 deflate 以外的压缩方法（LZMA、BZip2、PPMd、XZ、Deflate64 等）：libarchive 只为
+      这两种方法先解密，其他方法把密文直接交给解压器，报出与密码无关的错误。
     """
     try:
         with open(path, "rb") as stream:
-            # 目录项没有数据，标志位即使被设置也不影响解压。
-            return any(entry.flags & 0x1 and not entry.name.endswith(b"/")
-                       for entry in _read_central_directory(stream))
+            encrypted = [entry for entry, _ in _encrypted_entries(stream, check or _no_check)]
     except (OSError, JobError):
-        return False  # 结构异常的 zip 交给 bsdtar 处理并报告
+        return None  # 结构异常的 zip 交给 bsdtar 处理并报告
+    return bool(encrypted), any(stat.S_ISLNK(entry.mode) or entry.method not in _BSDTAR_DECRYPTABLE
+                                for entry in encrypted)
+
+
+def _encrypted_entries(stream: BinaryIO,
+                       check: Callable[[], None]) -> Iterator[tuple[_ZipEntry, bool]]:
+    """逐个给出加密的非目录成员，以及它的中央目录与本地头是否不一致（True 表示不一致）。
+
+    bsdtar 以本地头为准：名称、是否加密（bit 0 或 AES 方法 99）都看本地头。所以只有两处
+    名称都以 / 结尾才算目录、跳过（目录项没有数据，标志位不影响解压）；只要任一处标明加密
+    就算加密。两处记录不一（名称或加密标志不同）的归档只能是损坏或刻意构造的，不能因为
+    中央目录的说法就跳过它的密码校验。
+    """
+    for entry in _read_central_directory(stream):
+        check()
+        stream.seek(entry.local)
+        local = _LOCAL.unpack(_read_exact(stream, _LOCAL.size))
+        if local[0] != b"PK\x03\x04":
+            # 本地头读不出来：按中央目录的说法，交给密码校验和 bsdtar 去报告。
+            if entry.flags & 0x1 and not entry.name.endswith(b"/"):
+                yield entry, False
+            continue
+        local_name = _read_exact(stream, local[9])
+        if entry.name.endswith(b"/") and local_name.endswith(b"/"):
+            continue
+        central_enc = bool(entry.flags & 0x1)
+        local_enc = bool(local[2] & 0x1 or local[3] == 99)
+        if central_enc or local_enc:
+            yield entry, central_enc != local_enc or local_name != entry.name
+
+
+def zip_is_encrypted(path: Path) -> bool:
+    """zip 中是否有加密的成员，见 zip_encryption；读不了时返回 False。"""
+    return (zip_encryption(path) or (False, False))[0]
+
+
+_AES_EXTRA = 0x9901  # WinZip AES 扩展字段
+
+
+def _zipcrypto_check(password: bytes, header: bytes) -> int:
+    """按 PKWARE 传统加密算法解密 12 字节的加密头，返回最后一个字节（密码校验字节）。"""
+    keys = [0x12345678, 0x23456789, 0x34567890]
+
+    def crc(c: int, b: int) -> int:
+        return zlib.crc32(bytes([b]), c ^ 0xFFFFFFFF) ^ 0xFFFFFFFF
+
+    def update(b: int) -> None:
+        keys[0] = crc(keys[0], b)
+        keys[1] = ((keys[1] + (keys[0] & 0xFF)) * 134775813 + 1) & 0xFFFFFFFF
+        keys[2] = crc(keys[2], keys[1] >> 24)
+
+    for b in password:
+        update(b)
+    plain = 0
+    for c in header:
+        t = (keys[2] | 2) & 0xFFFF
+        plain = c ^ (((t * (t ^ 1)) >> 8) & 0xFF)
+        update(plain)
+    return plain
+
+
+def _aes_field(extra: bytes, offset: int, fmt: str) -> int | None:
+    """从扩展字段里找 WinZip AES 记录（版本 2 字节、厂商 2 字节、强度 1 字节、真实压缩方法
+    2 字节），按 fmt 读出记录内 offset 处的值（8 是强度，9 是真实压缩方法）；没有时返回 None。"""
+    i = 0
+    while i + 4 <= len(extra):
+        tag, size = struct.unpack_from("<HH", extra, i)
+        if tag == _AES_EXTRA and size >= 7 and i + 4 + size <= len(extra):
+            return struct.unpack_from(fmt, extra, i + offset)[0]
+        i += 4 + size
+    return None
+
+
+def _entry_password(stream: BinaryIO, entry: _ZipEntry, password: bytes) -> str:
+    """校验一个加密成员的密码，返回 "wrong"、"aes"（AES 校验值相符）、
+    "weak"（传统加密只有一个校验字节，或判断不了）。"""
+    stream.seek(entry.local)
+    local = _LOCAL.unpack(_read_exact(stream, _LOCAL.size))
+    if local[0] != b"PK\x03\x04":
+        return "weak"
+    stream.seek(entry.local + _LOCAL.size + local[9])
+    extra = _read_exact(stream, local[10])
+    if local[3] == 99:  # AES：盐之后是 2 字节的密码校验值
+        strength = _aes_field(extra, 8, "<B")
+        if strength not in (1, 2, 3):
+            return "weak"
+        key_len, salt_len = 8 * (strength + 1), 4 * (strength + 1)
+        salt = _read_exact(stream, salt_len)
+        verifier = _read_exact(stream, 2)
+        derived = hashlib.pbkdf2_hmac("sha1", password, salt, 1000, 2 * key_len + 2)
+        return "wrong" if derived[-2:] != verifier else "aes"
+    if (entry.flags | local[2]) & 0x40:  # PKWARE 强加密，不认识
+        return "weak"
+    # 传统加密：校验字节是 CRC 的高字节；用数据描述符（bit 3）时 CRC 写在后面，
+    # 改用修改时间的高字节。两种都接受，不会因解压器的取舍不同而误判正确的密码。
+    byte = _zipcrypto_check(password, _read_exact(stream, 12))
+    return "weak" if byte in (local[6] >> 24, (local[4] >> 8) & 0xFF) else "wrong"
+
+
+def check_zip_password(path: Path, password: str,
+                       check: Callable[[], None] | None = None) -> str:
+    """事先校验 zip 的密码，返回 "wrong"（一定不正确）、"strong"（所有加密成员都是 AES，
+    每个的校验值都相符，且中央目录与本地头的记录一致）或 "weak"（有传统加密的成员、
+    两处记录不一致，或判断不了；错误密码仍可能通过）。
+
+    bsdtar 遇到密码错误的成员会重新派生密钥再试，最多上万次；AES 每次都要做一千轮 PBKDF2，
+    一个成员就要几秒，成员多时等同于卡死。所以在交给 bsdtar 之前先自己逐个校验（每个 AES
+    成员一千轮 PBKDF2，与 bsdtar 解压时自己的开销相当）。只有全部校验过，"strong" 才可信：
+    ExtractJob 据此不再提防 bsdtar 的第二次提示。check 用于响应取消。
+    判断不了时按 "weak" 处理，交给 bsdtar，避免把正确的密码误判为错误。
+    """
+    check = check or _no_check
+    secret = password.encode("utf-8")
+    verdicts = set()
+    try:
+        with open(path, "rb") as stream:
+            for entry, inconsistent in _encrypted_entries(stream, check):
+                verdict = _entry_password(stream, entry, secret)
+                if verdict == "wrong":
+                    return "wrong"
+                # 两处记录不一致的归档不可信，不给 "strong"，bsdtar 第二次要密码时照样结束它。
+                verdicts.add("weak" if inconsistent else verdict)
+    except (OSError, JobError):
+        return "weak"
+    return "strong" if verdicts == {"aes"} else "weak"
 
 
 def extract_tools(family: str) -> tuple[str, ...]:
@@ -797,11 +976,15 @@ _U16_MAX, _U32_MAX = 0xFFFF, 0xFFFFFFFF
 
 @dataclass(frozen=True)
 class _ZipEntry:
-    """中央目录中的一项：中央头与本地头的绝对偏移、原始文件名字节和通用标志位。"""
+    """中央目录中的一项：中央头与本地头的绝对偏移、原始文件名字节、通用标志位，
+    外部属性高 16 位里的 Unix 文件类型和权限（不是 Unix 生成的归档通常为 0），以及压缩方法
+    （AES 成员取扩展字段里记录的真实方法）。"""
     central: int
     local: int
     name: bytes
     flags: int = 0
+    mode: int = 0
+    method: int = 0
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -905,7 +1088,12 @@ def _read_central_directory(stream: BinaryIO) -> list[_ZipEntry]:
         # 本地头必须位于中央目录之前；越界的偏移说明归档已损坏。
         if not 0 <= local < cd_start:
             raise JobError("zip_invalid")
-        entries.append(_ZipEntry(cd_start + i, local, name, h[3]))
+        method = h[4]
+        if method == 99:  # AES：真实的压缩方法记在扩展字段里，读不到时保留 99
+            real = _aes_field(extra, 9, "<H")
+            # 不能写成 “or method”：真实方法 0（存储）是合法值，会被当成没读到。
+            method = real if real is not None else method
+        entries.append(_ZipEntry(cd_start + i, local, name, h[3], h[15] >> 16, method))
         i = end
     if len(entries) != n_total:
         raise JobError("zip_invalid")
@@ -913,6 +1101,29 @@ def _read_central_directory(stream: BinaryIO) -> list[_ZipEntry]:
 
 
 _LOG_LINE_MAX = 2000  # 单行日志的最大字符数
+# 工具向标准输入要密码时打印的提示。bsdtar 的提示不换行，会粘在下一条消息前面；
+# 去掉后报错消息才能按原格式识别，日志也不会被重复的提示刷屏。
+_PROMPTS = re.compile(r"^(?:(?:Enter passphrase|Enter password):\s?)+")
+_PROMPT_BYTES = b"Enter passphrase:"  # bsdtar 每次向标准输入要密码时打印一次
+# 行首连续的提示。bsdtar 的错误行以成员名开头，名字中间的提示文字不计数。
+_LEADING_PROMPTS = re.compile(rb"^(?:Enter passphrase:)+")
+
+
+def _leading_prompts(data: bytes) -> int:
+    """返回 data 开头连续出现的 bsdtar 密码提示个数。"""
+    m = _LEADING_PROMPTS.match(data)
+    return len(m.group()) // len(_PROMPT_BYTES) if m else 0
+
+
+def _send_password(proc: subprocess.Popen, password: str) -> None:
+    """把密码写成一行送进工具的标准输入后立即关闭；工具提前退出时忽略管道错误。
+    密码很短，写入不会因管道缓冲区满而阻塞。"""
+    try:
+        proc.stdin.write((password + "\n").encode("utf-8"))
+    except OSError:
+        pass  # 工具已经退出（例如参数错误），失败原因由退出码报告
+    with contextlib.suppress(OSError):
+        proc.stdin.close()
 
 
 def _blame(results: list[tuple[str, int]], downstream: bool) -> tuple[str, int] | None:
@@ -973,6 +1184,10 @@ class Job:
     def cancel(self) -> None:
         """设置取消标记并终止已登记进程；清理和等待由 run 所在线程完成。"""
         self._cancel.set()
+        self._kill_processes()
+
+    def _kill_processes(self) -> None:
+        """结束所有仍在运行的已登记进程；可在任意线程调用。"""
         with self._procs_lock:
             for proc in self._procs:
                 if proc.poll() is None:
@@ -1028,14 +1243,20 @@ class Job:
             if proc.stdout and not proc.stdout.closed:
                 proc.stdout.close()
 
-    def _spawn(self, cmd: list[str], *, tool: str, **kw: Any) -> subprocess.Popen:
+    def _spawn(self, cmd: list[str], *, tool: str, password: str | None = None,
+               **kw: Any) -> subprocess.Popen:
         """记录 cmd 并以统一环境启动进程；tool 是 TOOLS 的 key，用于错误提示。
 
-        kw 传给 Popen，返回已登记的进程。
+        password 不为 None 时经标准输入交给工具（一行），不放进命令行：命令行参数其他本地
+        用户用 ps 也能看到。kw 传给 Popen，返回已登记的进程。
         """
         self._check_cancel()
         # 排除规则里的 Icon\r 含回车符，原样记录会把日志行截断，这里显示成转义形式。
         self.log("$ " + shlex.join(cmd).replace("\r", "\\r"))
+        if password is not None:
+            # bsdtar 和 7-Zip 在没有控制终端时才从标准输入读密码，否则会打开 /dev/tty 等待输入。
+            kw["stdin"] = subprocess.PIPE
+            kw["start_new_session"] = True
         # 不继承应用的标准输入：工具意外读取输入时立即读到 EOF，而不是让任务一直等待。
         kw.setdefault("stdin", subprocess.DEVNULL)
         kw.setdefault("start_new_session", self._new_session)
@@ -1053,36 +1274,69 @@ class Job:
                 raise JobError("tool_start_failed", tool=tool,
                                err=exc.strerror or str(exc)) from exc
             self._procs.append(p)
+        if password is not None:
+            _send_password(p, password)
         return p
 
     def _pump(self, stream: BinaryIO) -> threading.Thread:
-        """异步排空二进制日志流，避免管道写满阻塞子进程；返回读取线程。"""
+        """异步排空二进制日志流，避免管道写满阻塞子进程；返回读取线程。
+
+        按块而不是按行读取：bsdtar 的密码提示不换行，按行读要等到报错那一行才看得到。
+        每出现新的提示就调用 _on_prompts，子类据此及早发现密码被拒。
+        """
         def run() -> None:
-            for raw in iter(stream.readline, b""):
-                line = raw.decode("utf-8", "replace").rstrip()
-                if len(line) > _LOG_LINE_MAX:
-                    # 例如 bsdtar 反复提示输入密码时，一行可达上百 KB，会拖慢日志控件。
-                    line = line[:_LOG_LINE_MAX] + "…"
-                if line:
-                    self.log(line)
+            pending, seen = b"", 0  # 未成行的数据，以及其开头已经报告过的提示数
+            while chunk := stream.read1(65536):
+                pending += chunk
+                *lines, pending = pending.split(b"\n")
+                # 提示总在行首（前一条消息以换行结束），连续的提示连在一起；只数行首那一串，
+                # 成员名里夹带的提示文字不算。在整段数据上计数，提示被切在两块之间也不会漏。
+                new = 0
+                if lines:
+                    new += _leading_prompts(lines[0]) - seen  # 第一行就是之前未成行的数据
+                    new += sum(_leading_prompts(line) for line in lines[1:])
+                    seen = 0
+                current = _leading_prompts(pending)
+                new += current - seen
+                seen = current
+                if new > 0:
+                    self._on_prompts(new)
+                for raw in lines:
+                    self._emit_line(raw)
+            if pending:
+                self._emit_line(pending)
             stream.close()
         t = threading.Thread(target=run, daemon=True)
         self._pumps.append(t)
         t.start()
         return t
 
+    def _emit_line(self, raw: bytes) -> None:
+        """记录工具输出的一行：先去掉密码提示再截断，bsdtar 的提示会粘在报错前面。"""
+        line = _PROMPTS.sub("", raw.decode("utf-8", "replace").rstrip())
+        if len(line) > _LOG_LINE_MAX:
+            # 例如工具反复输出同一行时，一行可达上百 KB，会拖慢日志控件。
+            line = line[:_LOG_LINE_MAX] + "…"
+        if line:
+            self.log(line)
+
+    def _on_prompts(self, count: int) -> None:
+        """工具又打印了 count 次 bsdtar 的密码提示；在读取线程调用，默认不处理。"""
+
     def _run_simple(self, cmd: list[str], *, tool: str, cwd: Path,
-                    stdout: BinaryIO | None = None) -> None:
+                    stdout: BinaryIO | int | None = None, password: str | None = None) -> None:
         """运行单个命令并排空日志，任何非 0 退出码都按失败处理。
 
         stdout 为 None 时合并 stdout/stderr 写入日志；否则把 stdout 写入该文件，只记录 stderr。
+        password 的含义见 _spawn。
         """
         if stdout is None:
-            p = self._spawn(cmd, tool=tool, cwd=cwd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT)
+            p = self._spawn(cmd, tool=tool, password=password, cwd=cwd,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             t = self._pump(p.stdout)
         else:
-            p = self._spawn(cmd, tool=tool, cwd=cwd, stdout=stdout, stderr=subprocess.PIPE)
+            p = self._spawn(cmd, tool=tool, password=password, cwd=cwd, stdout=stdout,
+                            stderr=subprocess.PIPE)
             t = self._pump(p.stderr)
         rc = p.wait()
         t.join()
@@ -1116,19 +1370,34 @@ class Job:
 class ArchiveJob(Job):
     """一次性归档任务；run 在工作线程执行，cancel 可由主线程调用。"""
     def __init__(self, src: Path | str, out: Path | str, fmt: str, level: int | None = None,
-                 extreme: bool = False, log: Callable[[str], None] = print) -> None:
-        """src/out 为输入输出路径；fmt 选择格式，level/extreme 控制压缩，log 接收日志。"""
+                 extreme: bool = False, log: Callable[[str], None] = print, *,
+                 password: str | None = None, zip_method: str = ZIP_METHODS[0],
+                 encrypt_names: bool = True) -> None:
+        """src/out 为输入输出路径；fmt 选择格式，level/extreme 控制压缩，log 接收日志。
+
+        password 不为 None 时加密（只支持 ENCRYPTABLE 中的格式）：zip_method 是 ZIP_METHODS
+        之一，encrypt_names 决定 7z 是否连文件名一起加密（zip 的文件名总是可见）。
+        """
         super().__init__(log)
         self.src = Path(src).absolute()
         self.out = Path(out).absolute()
         self.fmt = FORMATS[fmt]
         self.level = level if level is not None else (self.fmt.level or (0, 0, 0))[2]
         self.extreme = extreme
+        self.password = password
+        self.zip_method = zip_method
+        self.encrypt_names = encrypt_names
 
     def _execute(self) -> Path:
         """验证输出位置，创建归档并原子提交，返回产物路径；异常时清理暂存数据。"""
         self._check_cancel()
-        missing = missing_tools(self.fmt.key)
+        if self.password is not None:
+            if self.fmt.key not in ENCRYPTABLE:
+                raise JobError("encrypt_unsupported", fmt=self.fmt.key)
+            if self.zip_method not in ZIP_METHODS:
+                raise ValueError(f"unknown zip method: {self.zip_method}")
+            check_password(self.password, self.fmt.key)
+        missing = missing_tools(self.fmt.key, encrypted=self.password is not None)
         if missing:
             raise JobError("missing_tools", fmt=self.fmt.key, tools=", ".join(missing))
         # 源可能在选择之后被删除或替换；源是链接时改用解析后的目标。
@@ -1194,6 +1463,9 @@ class ArchiveJob(Job):
 
     def _run_zip(self, tmp: Path) -> None:
         """生成 zip 递归排除参数并写入 tmp，保留符号链接本身。"""
+        if self.password is not None:
+            self._run_zip_encrypted(tmp)
+            return
         excludes = []
         for p in JUNK:  # zip 的 * 能跨越 /，四种写法覆盖任意层级
             excludes += [p, f"*/{p}", f"{p}/*", f"*/{p}/*"]
@@ -1203,6 +1475,31 @@ class ArchiveJob(Job):
         self._run_simple(cmd, tool="zip", cwd=self.src.parent)
         if sys.platform == "darwin":
             self._mark_zip_utf8(tmp)
+
+    def _run_zip_encrypted(self, tmp: Path) -> None:
+        """用 bsdtar 写加密 zip。Info-ZIP 的 zip 只能从终端（-e）或命令行（-P）拿密码，
+        而且只有 ZipCrypto；bsdtar 支持 AES-256，并在没有终端时从标准输入读密码。
+
+        hdrcharset=UTF-8 让 bsdtar 为非 ASCII 文件名设置 UTF-8 标志：从访达启动的应用没有
+        区域设置，bsdtar 在 C 区域下默认不设。排除规则与 tar 格式相同，符号链接按链接本身存储。
+        """
+        tar = require_tool("tar", self.fmt.key)
+        if not _is_bsdtar(tar):  # GNU tar 写不了 zip
+            raise JobError("missing_tools", fmt=self.fmt.key, tools="tar")
+        # 级别 0 存储不压缩；zip:compression-level 没写进 man 页，但 libarchive 3.7 支持。
+        level = "zip:compression=store" if self.level == 0 else \
+            f"zip:compression-level={self.level}"
+        cmd = [tar, "-c", "-f", str(tmp), "--format", "zip",
+               "--options", f"zip:encryption={self.zip_method},{level},zip:hdrcharset=UTF-8",
+               "--no-mac-metadata", "--no-xattrs"]
+        if self._name.startswith("./"):
+            # 为避开选项解析加的 ./ 不应留在成员名里（Info-ZIP 和 7-Zip 都会去掉）；
+            # H、S 表示不改硬链接和符号链接的目标。
+            cmd += ["-s", r",^\./,,HS"]
+        for p in JUNK:
+            cmd += ["--exclude", p]
+        self._run_simple(cmd + [self._name], tool="tar", cwd=self.src.parent,
+                         password=self.password)
 
     def _mark_zip_utf8(self, path: Path) -> None:
         """为 macOS zip 的 UTF-8 文件名补标记；只改头部，不重新压缩文件内容。"""
@@ -1240,8 +1537,11 @@ class ArchiveJob(Job):
                "-snl", "-bb1", "-bsp0", "-y", str(tmp), self._name]
         # -xr! 对任意层级的文件名递归匹配，避免只排除顶层垃圾。
         cmd += [f"-xr!{p}" for p in JUNK]
+        if self.password is not None:
+            # 不带值的 -p 让 7-Zip 从标准输入读密码（AES-256）；-mhe 决定是否加密文件名。
+            cmd[2:2] = ["-p", f"-mhe={'on' if self.encrypt_names else 'off'}"]
         # 退出码 1 可能表示部分文件未读到，_run_simple 会把它当作失败，不提交不完整的归档。
-        self._run_simple(cmd, tool="7z", cwd=self.src.parent)
+        self._run_simple(cmd, tool="7z", cwd=self.src.parent, password=self.password)
 
 
 # ---------- 解压：提交与隔离属性 ----------
@@ -1350,20 +1650,36 @@ def apply_quarantine(root: Path, value: str,
 
 # ---------- 解压任务 ----------
 # 解压时 bsdtar 的公共选项：不恢复属主、权限位（按 umask）、扩展属性、ACL、文件标志和
-# 资源分叉，避免归档把这些元数据强加到用户的文件上。--passphrase 给一个假密码：
-# 加密的 zip 立即以“密码错误”失败，不会反复提示上万次。
+# 资源分叉，避免归档把这些元数据强加到用户的文件上。
 _BSDTAR_EXTRACT = ["--no-same-owner", "--no-same-permissions", "--no-xattrs", "--no-acls",
-                   "--no-fflags", "--no-mac-metadata", "--passphrase", "cleanpack-no-password"]
+                   "--no-fflags", "--no-mac-metadata"]
+# 没有密码时给 bsdtar 一个假密码：加密的 zip 立即以“密码错误”失败，不会反复提示上万次。
+# 有密码时不加这一项，bsdtar 改从标准输入读真正的密码。
+_NO_PASSWORD = ["--passphrase", "cleanpack-no-password"]
 # 工具报告“归档已加密”的原话。成员名会出现在同一行里，所以按各工具的行格式锚定：
-# bsdtar 是「成员: 消息[: Unknown error: -1]」，消息在行尾；7-Zip 的消息在行首，成员名在
-# 「 : 」之后。这样成员名既不能伪造出加密提示，也不会把真正的提示挡掉。
+# bsdtar 是「成员: 消息[: Unknown error: -1]」，消息在行尾，其他错误行的末尾总是 bsdtar 自己
+# 加的系统错误说明；7-Zip 的消息在行首，成员名在「 : 」之后。另外只对可能加密的归档采信
+# （ExtractJob._encryption_possible），tar 系列里伪造的提示一律忽略。
 _BSDTAR_ENCRYPTED = re.compile(
-    r"(^|: )(Incorrect passphrase|Passphrase required for this entry"
+    r"(^|: )(Incorrect passphrase|Too many incorrect passphrases|Passphrase required for this entry"
     r"|The (archive header|file content) is encrypted, but currently not supported"
-    r"|Encrypted file is unsupported)(: [A-Za-z ]*error: -?\d+)?$")
+    r"|Encrypted file is unsupported)(: Unknown error: -1)?$")
 _SEVENZIP_ENCRYPTED = re.compile(
-    r"^(ERROR: )?(Data Error in encrypted file\. Wrong password\? : "
+    r"^(ERROR: )?((Data Error|CRC Failed) in encrypted file\. Wrong password\? : "
+    r"|Wrong password : "
     r"|Cannot open encrypted archive\. Wrong password\?$)")
+# bsdtar 解出的数据不对：错误密码偶然通过 ZipCrypto 的单字节校验，或者数据本身损坏。
+_BSDTAR_DATA_ERROR = re.compile(
+    r": (ZIP bad CRC: 0x[0-9a-f]+ should be 0x[0-9a-f]+|ZIP decompression failed \(-?\d+\)"
+    r"|Truncated ZIP file data)(: Unknown error: -1)?$")
+# bsdtar 解不了的 zip 成员：AES 加密的符号链接（7-Zip 用 -snl 生成的加密 zip 里会有），
+# 以及 Deflate64 等它不支持的压缩方法。这不是密码错误，改用 7-Zip 重试。成员名即使伪造出
+# 这句话，后果也只是改用 7-Zip，安全检查照常进行。
+_BSDTAR_ZIP_UNSUPPORTED = re.compile(
+    r"(^tar: Unsupported ZIP compression method during decompression of link entry "
+    r"\(\d+: [a-z0-9-]+\)"
+    r"|: Unsupported ZIP compression method \(\d+: [a-z0-9-]+\): "
+    r"Inappropriate file type or format)$")
 
 
 def _mentions_encryption(line: str, tool: str) -> bool:
@@ -1382,12 +1698,27 @@ class ExtractJob(Job):
     _new_session = True
 
     def __init__(self, archive: Path | str, dest: Path | str,
-                 log: Callable[[str], None] = print) -> None:
-        """archive 为归档路径，dest 为放置结果的文件夹，log 接收命令行和工具输出。"""
+                 log: Callable[[str], None] = print, *, password: str | None = None) -> None:
+        """archive 为归档路径，dest 为放置结果的文件夹，log 接收命令行和工具输出。
+
+        password 为 None 时遇到加密归档报 archive_encrypted，界面据此询问密码后带密码重试；
+        密码不正确时报 archive_wrong_password，无法区分密码错误和数据损坏时报
+        archive_password_or_damaged。加密的 7z 需要 7-Zip，没装时报 archive_encrypted_needs_7z。
+        """
         self._user_log = log
+        self.password = password
         self._encrypted = False
+        self._family = ""
+        self._encryption_possible = False  # 这个归档可能加密，工具的加密提示才可信
+        self._zip_encrypted = False  # 中央目录显示有加密成员
+        self._zip_needs_7z = False  # 有 bsdtar 解不了的加密成员（链接或少见的压缩方法）
+        self._zip_weak = False  # 预检无法排除错误密码（有传统加密的成员或判断不了）
+        self._zip_strong = False  # 预检已确认密码（全是 AES 成员，校验值相符）
+        self._data_error = False  # bsdtar 报告解出的数据校验失败
         self._decoder = "tar"  # 当前产生输出的解压工具，决定按哪种格式识别加密提示
         self._damaged = False
+        self._zip_unsupported = False  # bsdtar 报告有它解不了、7-Zip 能解的 zip 成员
+        self._prompts = 0  # bsdtar 向标准输入要密码的次数
         self.archive = Path(archive).absolute()
         self.dest = Path(dest).absolute()
         super().__init__(self._log_line)
@@ -1396,17 +1727,34 @@ class ExtractJob(Job):
 
     def _log_line(self, line: str) -> None:
         """转发日志，同时留意工具报告的加密提示，失败时给出更明确的原因。"""
-        if not line.startswith("$ ") and _mentions_encryption(line, self._decoder):
+        if (self._encryption_possible and not line.startswith("$ ")
+                and _mentions_encryption(line, self._decoder)):
             self._encrypted = True
         # bsdtar 跳过损坏的 tar 头时只打印这一行并继续，退出码仍可能是 0，跳过的项会悄悄丢失。
         if self._decoder == "tar" and line == "tar: Damaged tar archive":
             self._damaged = True
+        if self._decoder == "tar" and _BSDTAR_ZIP_UNSUPPORTED.search(line):
+            self._zip_unsupported = True
+        if self._decoder == "tar" and _BSDTAR_DATA_ERROR.search(line):
+            self._data_error = True
         self._user_log(line)
+
+    def _on_prompts(self, count: int) -> None:
+        """标准输入里只有一行密码，bsdtar 第二次要密码说明它拒绝了这个密码。它接下来会对每个
+        成员重试上万次（AES 每个成员要几秒），所以立即结束它，按密码错误报告。"""
+        self._prompts += count
+        # 预检已确认密码时不必提防：第二次提示只可能来自伪造的成员名，不能据此误报密码错误。
+        if (self.password is not None and self._decoder == "tar" and not self._zip_strong
+                and self._prompts > 1):
+            self._encrypted = True
+            self._kill_processes()
 
     def _execute(self) -> Path:
         """校验、解压、整理并提交，返回放置后的路径；失败或取消时暂存目录整个删除。"""
         self._check_cancel()
         raise_fd_limit()
+        if self.password is not None:
+            check_password(self.password, None)
         self.archive = validate_archive(self.archive)
         family = extract_family(self.archive)
         fmt = _FORMAT_OF_FAMILY[family]
@@ -1416,9 +1764,25 @@ class ExtractJob(Job):
         check_output_dir(self.dest)
         # 开头有额外数据（例如自解压程序）的 zip 没有魔数，按扩展名路由到 bsdtar 后它仍会当作
         # zip 读取；所以扩展名决定路线时也要检查，避免假密码被偶然接受。
-        if ((family == "zip" or sniff_family(self.archive) is None)
-                and zip_is_encrypted(self.archive)):
-            raise JobError("archive_encrypted")
+        self._family = family
+        if family == "zip" or sniff_family(self.archive) is None:
+            info = zip_encryption(self.archive, self._check_cancel)
+            self._zip_encrypted, self._zip_needs_7z = info or (False, False)
+            # 中央目录读不了（例如下载不完整）时无法预先判断，只能相信 bsdtar 的提示。
+            self._encryption_possible = info is None or self._zip_encrypted
+        else:
+            self._encryption_possible = family == "7z"
+        if self._zip_encrypted:
+            if self._zip_needs_7z:
+                # 只有 7-Zip 能解，没装时先说明，不要让用户白输密码。
+                self._require_7z("archive_zip_needs_7z")
+            if self.password is None:
+                raise JobError("archive_encrypted")
+            verdict = check_zip_password(self.archive, self.password, self._check_cancel)
+            if verdict == "wrong":
+                raise JobError("archive_wrong_password")
+            self._zip_weak = verdict == "weak"
+            self._zip_strong = verdict == "strong"
         quarantine = read_quarantine(self.archive)
 
         with self._staging(self.dest) as staging:
@@ -1480,44 +1844,91 @@ class ExtractJob(Job):
             zstd = require_tool("zstd", "tar.zst")
             self._run_simple([zstd, "-t", "-q", str(self.archive)], tool="zstd", cwd=root)
             self._run_pipeline([zstd, "-d", "-c", "-q", str(self.archive)],
-                               [tar, "-x", "-f", "-", *_BSDTAR_EXTRACT, *excludes],
+                               [tar, "-x", "-f", "-", *_BSDTAR_EXTRACT, *_NO_PASSWORD, *excludes],
                                tools=("zstd", "tar"), cwd=root, stdout=subprocess.DEVNULL,
                                blame_downstream=False)
             return
+        # 名为 .7z、实为带前置数据的 zip 时，中央目录已经说明它是加密 zip，按 zip 处理。
+        if family == "7z" and self.password is not None and not self._zip_encrypted:
+            # bsdtar 解不了 AES 加密的 7z，有密码时直接交给 7-Zip。
+            self._run_7z_fallback(self._require_7z("archive_encrypted_needs_7z"), root)
+            return
+        if self._zip_needs_7z:
+            self._run_7z_fallback(self._require_7z("archive_zip_needs_7z"), root)
+            return
         try:
-            self._run_simple([tar, "-x", "-f", str(self.archive), *_BSDTAR_EXTRACT, *excludes],
-                             tool="tar", cwd=root, stdout=subprocess.DEVNULL)
+            self._run_simple([tar, "-x", "-f", str(self.archive), *_BSDTAR_EXTRACT,
+                              *(_NO_PASSWORD if self.password is None else []), *excludes],
+                             tool="tar", cwd=root, stdout=subprocess.DEVNULL,
+                             password=self.password)
             return
         except JobError as exc:
             if self._encrypted:
-                raise JobError("archive_encrypted") from exc
-            if family != "7z":
-                raise
-            seven = locate("7z")
-            if seven is None:
+                raise self._password_error() from exc
+            if self._zip_unsupported:
+                # 密码没问题，只是 libarchive 不支持其中的压缩方法或加密的链接成员；7-Zip 支持。
+                seven = self._require_7z("archive_zip_needs_7z")
+            elif self._zip_weak and self._data_error:
+                # bsdtar 报数据校验失败。可能是错误密码偶然通过了 ZipCrypto 的单字节校验，
+                # 也可能是 bsdtar 自己误判：Info-ZIP 流式写出的 zip 在本地头的 CRC 字段里放的是
+                # 它的校验值，libarchive 会当成真实 CRC。7-Zip 自己校验数据，密码错误时会明确
+                # 报告，所以装了 7-Zip 就交给它；没装时分不清原因，只能如实说“密码或数据有问题”。
+                # 其他失败（例如磁盘已满、成员路径含 ..）与密码无关，照实报告，免得界面反复要密码。
+                seven = locate("7z")
+                if seven is None:
+                    raise JobError("archive_password_or_damaged") from exc
+            elif family == "7z":
                 # 系统 tar 读不了这个 7z 的编码方式，装上 7-Zip 就能解开，要明确告诉用户。
-                raise JobError("archive_needs_7z") from exc
+                seven = self._require_7z("archive_needs_7z")
+            else:
+                raise
             self.log("→ 7z")
         self._run_7z_fallback(seven, root)
 
+    def _require_7z(self, key: str) -> str:
+        """返回 7-Zip 的路径；没有安装时以 key 报告为什么需要它。"""
+        seven = locate("7z")
+        if seven is None:
+            raise JobError(key)
+        return seven
+
+    def _password_error(self) -> JobError:
+        """工具报告了加密提示时的错误：没给密码就是需要密码，给了就是密码不正确。
+        加密的 7z 只有 7-Zip 能解，没装时先说明这一点，不要让用户白输一次密码。"""
+        if self._family == "7z" and not self._zip_encrypted and locate("7z") is None:
+            return JobError("archive_encrypted_needs_7z")
+        return JobError("archive_encrypted" if self.password is None
+                        else "archive_wrong_password")
+
     def _run_7z_fallback(self, seven: str, root: Path) -> None:
-        """bsdtar 解不了的 7z（少见的编码组合）改用 7-Zip，在清空的解压根目录里重来。
+        """用 7-Zip 解压 bsdtar 解不了的归档：少见编码组合或 AES 加密的 7z，以及含加密链接成员
+        或 Deflate64 等压缩方法的 zip。在清空的解压根目录里重来。
 
         -snld 只保留解析后仍在输出目录内的相对链接，越界的相对链接会被拒绝并以 2 退出；
-        -spd 关闭文件名通配，否则名为 a*.7z 的归档会连同旁边匹配的归档一起解开；
-        -p 给出空密码，加密归档立即失败而不是等待输入。
+        -spd 关闭文件名通配，否则名为 a*.7z 的归档会连同旁边匹配的归档一起解开。
+        没有密码时用不带值的 -p 给出空密码，加密归档立即失败而不是等待输入；有密码时省略 -p，
+        7-Zip 需要密码时从标准输入读取。
         """
         make_tree_accessible(root, self._check_cancel)
         shutil.rmtree(root)
         root.mkdir()
         self._decoder = "7z"
-        cmd = [seven, "x", "-y", "-bsp0", "-bb1", "-snld", "-spd", "-p", f"-o{root}",
+        # 解的是 zip 时指定 -tzip：7-Zip 按扩展名选格式，名为 .zip、开头带前置数据的归档
+        # 不指定就打不开（名为 .7z 的反而会按内容找到 zip）。
+        is_zip = self._family == "zip" or self._zip_encrypted or self._zip_unsupported
+        cmd = [seven, "x", "-y", "-bsp0", "-bb1", "-snld", "-spd",
+               *(["-tzip"] if is_zip else []),
+               *(["-p"] if self.password is None else []), f"-o{root}",
                *[f"-xr!{p}" for p in JUNK], str(self.archive)]
         try:
-            self._run_simple(cmd, tool="7z", cwd=root)
+            self._run_simple(cmd, tool="7z", cwd=root, password=self.password)
         except JobError as exc:
+            if self._encrypted and self._zip_strong and self.password is not None \
+                    and len(self.password.encode("utf-8")) > PASSWORD_MAX:
+                # 预检已确认密码，7-Zip 却拒绝：它解 WinZip AES 时不接受超过 99 字节的密码。
+                raise JobError("archive_password_too_long_7z", max=PASSWORD_MAX) from exc
             if self._encrypted:
-                raise JobError("archive_encrypted") from exc
+                raise self._password_error() from exc
             raise
         _restore_rerooted_links(root)
 

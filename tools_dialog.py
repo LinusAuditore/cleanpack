@@ -53,8 +53,9 @@ class ToolchainController(QObject):
         self.paths = {k: core.locate(k) for k in core.TOOLS}
         self.changed.emit()
 
-    def missing_for(self, fmt_key: str) -> list[str]:
-        return core.missing_tools(fmt_key, self.paths)
+    def missing_for(self, fmt_key: str, encrypted: bool = False) -> list[str]:
+        """返回压缩 fmt_key 缺少的工具；encrypted 表示要加密（加密 zip 改用系统 tar）。"""
+        return core.missing_tools(fmt_key, self.paths, encrypted)
 
     def missing_formulas(self) -> list[str]:
         return core.missing_formulas(self.paths)

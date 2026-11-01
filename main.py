@@ -15,8 +15,9 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
                                QWidget)
 
 import core
-from gui_common import (NOTE_STYLE, WARN_STYLE, PathInput, confirm, format_secs,
+from gui_common import (NOTE_STYLE, WARN_STYLE, PathInput, ask_password, confirm, format_secs,
                         format_size, install_qt_translator, process_environment)
+from encrypt_panel import EncryptPanel
 from extract_panel import ExtractPanel
 from i18n import LANGS, current_lang, detect_lang, set_lang, tr
 from tools_dialog import ToolchainController, ToolsDialog, brew_notice
@@ -25,6 +26,8 @@ from tools_dialog import ToolchainController, ToolsDialog, brew_notice
 DEFAULT_FORMAT = "zip"
 # 模式切换标签的顺序，也是偏好 mode 的取值。
 MODES = ("compress", "extract")
+# 解压任务因这些原因失败时询问密码，带密码重试，而不是报告失败。
+PASSWORD_ERRORS = ("archive_encrypted", "archive_wrong_password", "archive_password_or_damaged")
 
 
 class Bridge(QObject):
@@ -46,6 +49,10 @@ class MainWindow(QWidget):
         self._worker: threading.Thread | None = None
         self._quit_requested = False
         self._quit_ready = False
+        self._closed = False  # 窗口已关闭；询问密码期间关闭窗口后不再重试
+        self._confirming_quit = False  # 退出确认框正在显示
+        # 退出确认框显示期间需要密码的解压任务：等用户决定不退出后再询问密码。
+        self._deferred_retry: tuple[core.ExtractJob, core.JobError] | None = None
         self._last_fmt: str | None = None
         self.t0 = 0.0
 
@@ -154,7 +161,7 @@ class MainWindow(QWidget):
         return self.src_box
 
     def _build_options_group(self) -> QGroupBox:
-        """构建格式、级别和输出设置，返回选项分组。"""
+        """构建格式、级别、加密和输出设置，返回选项分组。"""
         self.opt_box = QGroupBox()
         g = QGridLayout(self.opt_box)
         self.fmt_lbl = QLabel()
@@ -189,21 +196,27 @@ class MainWindow(QWidget):
         self.extreme_chk = QCheckBox()
         g.addWidget(self.extreme_chk, 3, 1, 1, 4)
 
+        self.encrypt_panel = EncryptPanel(self)
+        self.encrypt_panel.changed.connect(self.update_go_state)
+        # 打开加密选项后内容变多，等布局更新完再把窗口加高到能完整显示说明文字。
+        self.encrypt_panel.changed.connect(lambda: QTimer.singleShot(0, self.grow_to_fit))
+        row = self.encrypt_panel.place(g, 4, 4)
+
         self.out_lbl = QLabel()
         self.out_input = PathInput(self._parse_output)
         self.out_input.committed.connect(self.on_output_committed)
         self.out_input.checked.connect(self.update_go_state)
         self.btn_save = QPushButton()
         self.btn_save.clicked.connect(self.choose_output)
-        g.addWidget(self.out_lbl, 4, 0)
-        g.addWidget(self.out_input, 4, 1, 1, 3)
-        g.addWidget(self.btn_save, 4, 4)
-        g.addWidget(self.out_input.hint, 5, 1, 1, 4)
+        g.addWidget(self.out_lbl, row, 0)
+        g.addWidget(self.out_input, row, 1, 1, 3)
+        g.addWidget(self.btn_save, row, 4)
+        g.addWidget(self.out_input.hint, row + 1, 1, 1, 4)
 
         self.excl_lbl = QLabel()
         self.excl_lbl.setWordWrap(True)
         self.excl_lbl.setStyleSheet(NOTE_STYLE)
-        g.addWidget(self.excl_lbl, 6, 0, 1, 5)
+        g.addWidget(self.excl_lbl, row + 2, 0, 1, 5)
         g.setColumnStretch(2, 1)
         return self.opt_box
 
@@ -277,10 +290,27 @@ class MainWindow(QWidget):
         for i, mode in enumerate(MODES):
             self.mode_tabs.setTabText(i, tr(f"mode_{mode}"))
         self.btn_go.setText(tr("extract") if self.is_extract() else tr("compress"))
+        self.encrypt_panel.retranslate()
         self.extract_panel.retranslate()
         self.tools_dialog.retranslate()
         self.on_level_changed()
         self.refresh_busy_ui()
+        # 换语言后说明文字的行数会变，等布局更新后再按需加高窗口。
+        QTimer.singleShot(0, self.grow_to_fit)
+
+    def grow_to_fit(self) -> None:
+        """窗口矮于内容所需的最小高度时加高，不缩小用户调整过的窗口。
+
+        窗口的最小高度不考虑自动换行的标签需要几行，只按它加高时，加密说明会被压成一行、
+        后半句看不到；这里按当前宽度计算换行后的最小高度。
+        """
+        layout = self.layout()
+        layout.activate()
+        need = layout.totalMinimumHeightForWidth(self.width())
+        if (screen := self.screen()) is not None:
+            need = min(need, screen.availableGeometry().height())
+        if self.height() < need:
+            self.resize(self.width(), need)
 
     # ---------------- 模式 / 语言 / 格式 / 级别 ----------------
     def is_extract(self) -> bool:
@@ -334,6 +364,7 @@ class MainWindow(QWidget):
             self.level_slider.setValue(default)
             self.level_slider.blockSignals(False)
         self.extreme_chk.setVisible(fmt.key == "tar.xz")
+        self.encrypt_panel.set_format(fmt.key)
         self.on_level_changed()
         # macOS 上点选格式菜单不会让输出框失去焦点，先提交其中的草稿，免得被自动路径覆盖。
         if self.out_input.pending and self.out_input.isEnabled():
@@ -342,6 +373,8 @@ class MainWindow(QWidget):
         if self.out_input.error is None:
             self.update_output_path()
         self.update_go_state()
+        # 换格式会显示或隐藏加密说明等行，等布局更新后再按需加高窗口。
+        QTimer.singleShot(0, self.grow_to_fit)
 
     def on_level_changed(self, *_: object) -> None:
         """根据滑块值刷新仅存储或高内存提示；忽略 Qt 信号的附加参数。"""
@@ -468,7 +501,7 @@ class MainWindow(QWidget):
             return (self.extract_panel.format_key(),
                     self.extract_panel.missing_tools(self.tools.paths))
         fmt = self.current_format().key
-        return fmt, self.tools.missing_for(fmt)
+        return fmt, self.tools.missing_for(fmt, self.encrypt_panel.encrypting())
 
     def update_banner(self) -> None:
         """只在当前格式缺工具或正在安装时显示横幅；文案不写位置，按钮直接打开工具链窗口。"""
@@ -520,6 +553,8 @@ class MainWindow(QWidget):
         else:
             src_ok = has_src and self.src_input.error is None
             out_ok = self.out_input.error is None and self.out_input.note is None
+        # 密码的问题显示在加密选项里；不合格时不能开始。
+        out_ok = out_ok and self.encrypt_panel.problem() is None
         # 选定源之前还没有可组合的输出路径，另存为和输出框暂不可用，避免选择被静默丢弃。
         self.btn_save.setEnabled(has_src and not busy)
         self.out_input.setEnabled(has_src and not busy)
@@ -550,6 +585,7 @@ class MainWindow(QWidget):
                   self.fmt_combo, self.extreme_chk):
             w.setEnabled(not busy)
         self.level_slider.setEnabled(not busy and self.current_format().level is not None)
+        self.encrypt_panel.set_busy(busy)
         self.update_go_state()
 
     def start(self) -> None:
@@ -583,15 +619,20 @@ class MainWindow(QWidget):
             err = exc if isinstance(exc, core.JobError) else core.job_error_from_os(exc)
             self.show_message(QMessageBox.Warning, tr("failed", err=tr(err.key, **err.kw)))
             return
+        if self.encrypt_panel.problem() is not None:
+            return  # 原因已显示在加密选项里
         if out.exists() and not confirm(self, tr("overwrite_title"),
                                         tr("overwrite_q", path=out), "replace"):
             return
         fmt = self.current_format()
+        enc = self.encrypt_panel
         self._launch(core.ArchiveJob(
             self.src, out, fmt.key,
             level=self.level_slider.value() if fmt.level else None,
             extreme=self.extreme_chk.isChecked() and fmt.key == "tar.xz",
             log=self.bridge.log.emit,
+            password=enc.password(), zip_method=enc.zip_method(),
+            encrypt_names=enc.encrypt_names(),
         ))
 
     def start_extract(self) -> None:
@@ -648,10 +689,21 @@ class MainWindow(QWidget):
         self.job = None
         self._worker = None
         self.tools.set_job_running(False)
+        if (isinstance(job, core.ExtractJob) and isinstance(err, core.JobError)
+                and err.key in PASSWORD_ERRORS and not self._quit_requested):
+            self.append_log(tr(err.key, **err.kw))
+            if self._confirming_quit:
+                # 不在退出确认框上面再弹密码框，更不能在用户回答之前启动新的解压。
+                self._deferred_retry = (job, err)
+            else:
+                self._retry_with_password(job, err)
+            return
         if err is None:
             assert path is not None
             if isinstance(job, core.ExtractJob):
                 self._log_extract_notes(job)
+            elif isinstance(job, core.ArchiveJob) and job.password is not None:
+                self.encrypt_panel.clear_passwords()
             msg = self._done_message(path, extract)
             self.append_log(msg)
             if not self._quit_requested:
@@ -664,6 +716,22 @@ class MainWindow(QWidget):
             if not self._quit_requested:
                 self.show_message(QMessageBox.Warning, text)
         self._maybe_finish_quit()
+
+    def _retry_with_password(self, job: core.ExtractJob, err: core.JobError) -> None:
+        """归档需要密码或密码不正确时询问密码，带密码重新解压；用户取消时按取消处理。
+
+        第一次询问（还没给过密码）不显示错误，之后的询问附上上次失败的原因。
+        """
+        error = tr(err.key, **err.kw) if job.password is not None else None
+        password = ask_password(self, tr("password_prompt", name=job.archive.name), error)
+        if self._closed or self._quit_requested:
+            return  # 询问期间窗口已关闭或开始退出
+        if password is None:
+            self.append_log(tr("extract_cancelled"))
+            self._maybe_finish_quit()
+            return
+        self._launch(core.ExtractJob(job.archive, job.dest, log=self.bridge.log.emit,
+                                     password=password))
 
     def _log_extract_notes(self, job: core.ExtractJob) -> None:
         """把解压的警告（越界链接、隔离属性）写进日志。
@@ -725,14 +793,25 @@ class MainWindow(QWidget):
         """任务或安装进行中时先确认，再取消并等它结束后关闭，不留下孤立进程和暂存文件。"""
         if self._quit_ready or not self.is_busy():
             self.tools_dialog.hide()
+            self._closed = True
             e.accept()
             return
         e.ignore()
         if self._quit_requested:
             return
         question = tr("quit_job_q") if self.job else tr("quit_install_q")
-        if not confirm(self, tr("quit_title", app=core.APP_NAME), question, "stop_quit"):
+        self._confirming_quit = True
+        try:
+            stop = confirm(self, tr("quit_title", app=core.APP_NAME), question, "stop_quit")
+        finally:
+            self._confirming_quit = False
+        retry, self._deferred_retry = self._deferred_retry, None
+        if not stop:
+            if retry is not None:
+                self._retry_with_password(*retry)
             return
+        if retry is not None:
+            self.append_log(tr("extract_cancelled"))
         self._quit_requested = True
         self.append_log(tr("quitting"))
         self.cancel_job()

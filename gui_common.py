@@ -1,4 +1,4 @@
-"""GUI 公用的 Qt 辅助：子进程环境、样式、Qt 翻译、本地化数字、确认对话框和可键入的路径框。"""
+"""GUI 公用的 Qt 辅助：子进程环境、样式、Qt 翻译、本地化数字、确认与密码对话框和可键入的路径框。"""
 from __future__ import annotations
 
 from typing import Any, Callable
@@ -6,7 +6,8 @@ from typing import Any, Callable
 from PySide6.QtCore import (QCoreApplication, QLibraryInfo, QLocale, QProcessEnvironment, Qt,
                             QTimer, QTranslator, Signal)
 from PySide6.QtGui import QFocusEvent
-from PySide6.QtWidgets import QLabel, QLineEdit, QMessageBox, QWidget
+from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QLabel, QLineEdit,
+                               QMessageBox, QVBoxLayout, QWidget)
 
 import core
 from i18n import QT_LOCALES, current_lang, tr
@@ -76,6 +77,80 @@ def confirm(parent: QWidget, title: str, text: str, accept_key: str) -> bool:
     box.setEscapeButton(cancel)
     box.exec()
     return box.clickedButton() is accept
+
+
+def ask_password(parent: QWidget, text: str, error: str | None = None) -> str | None:
+    """询问解压用的密码，返回输入的密码；用户取消时返回 None。
+
+    text 说明要哪个归档的密码，error 是上一次尝试失败的原因。这不是破坏性操作的确认，
+    所以回车即确定、Esc 取消；按钮文字跟随应用语言。密码不合格（空、控制字符、过长）时
+    确定按钮不可用；输入了内容才显示原因，空着时只停用按钮。
+    """
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(tr("password_title"))
+    # 默认宽度只有两百像素左右，归档名稍长说明就会一行只剩几个字。
+    dlg.setMinimumWidth(380)
+    layout = QVBoxLayout(dlg)
+    label = QLabel(text)
+    label.setWordWrap(True)
+    layout.addWidget(label)
+    if error:
+        err_lbl = QLabel(error)
+        err_lbl.setWordWrap(True)
+        err_lbl.setStyleSheet(WARN_STYLE)
+        layout.addWidget(err_lbl)
+    field = QLineEdit()
+    field.setEchoMode(QLineEdit.EchoMode.Password)
+    field.setAcceptDrops(False)
+    layout.addWidget(field)
+    show = QCheckBox(tr("show_password"))
+    show.toggled.connect(lambda on: field.setEchoMode(
+        QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+    layout.addWidget(show)
+    hint = QLabel()
+    hint.setWordWrap(True)
+    hint.setStyleSheet(WARN_STYLE)
+    hint.hide()
+    layout.addWidget(hint)
+    buttons = QDialogButtonBox()
+    ok = buttons.addButton(tr("extract"), QDialogButtonBox.ButtonRole.AcceptRole)
+    buttons.addButton(tr("cancel"), QDialogButtonBox.ButtonRole.RejectRole)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    layout.addWidget(buttons)
+
+    def validate() -> None:
+        try:
+            core.check_password(field.text(), None)
+            problem = ""
+        except core.JobError as exc:
+            # 还没输入时不提示，只停用确定按钮。
+            problem = tr(exc.key, **exc.kw) if field.text() else ""
+            ok.setEnabled(False)
+        else:
+            ok.setEnabled(True)
+        hint.setText(problem)
+        hint.setVisible(bool(problem))
+        # 提示出现后内容变高；等布局更新完再加高对话框，免得说明和提示被压成一行。
+        QTimer.singleShot(0, dlg, grow)  # 以对话框为上下文：对话框销毁后不会再调用
+
+    def grow() -> None:
+        layout.activate()
+        need = layout.totalMinimumHeightForWidth(dlg.width())
+        if dlg.height() < need:
+            dlg.resize(dlg.width(), need)
+
+    field.textChanged.connect(validate)
+    validate()
+    ok.setDefault(True)
+    field.setFocus()
+    accepted = dlg.exec() == QDialog.DialogCode.Accepted
+    password = field.text() if accepted else None
+    # 对话框挂在主窗口下，不销毁就会把输入过的密码一直留在隐藏的输入框里。setText 同时清空
+    # 撤销历史（clear 不会）。
+    field.setText("")
+    dlg.deleteLater()
+    return password
 
 
 class PathInput(QLineEdit):
