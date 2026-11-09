@@ -11,10 +11,12 @@ import i18n
 
 ROOT = Path(core.__file__).resolve().parent
 GUI_FILES = ("main.py", "gui_common.py", "tools_dialog.py", "extract_panel.py",
-             "encrypt_panel.py")
+             "encrypt_panel.py", "theme.py")
 # 以 f-string 拼出的 key（main.MODES 的每个模式、core.ZIP_METHODS 的每种加密方式），
 # 静态扫描看不到，在这里列出。
-DYNAMIC_KEYS = {"mode_compress", "mode_extract"} | {f"zip_{m}" for m in core.ZIP_METHODS}
+DYNAMIC_KEYS = ({"mode_compress", "mode_extract"} | {f"zip_{m}" for m in core.ZIP_METHODS}
+                # 外观菜单按 theme.APPEARANCES 拼出键名（这里不导入 Qt，所以照抄三个值）。
+                | {f"appearance_{m}" for m in ("system", "light", "dark")})
 
 
 def strings_node() -> ast.Dict:
@@ -100,6 +102,7 @@ class I18nTests(unittest.TestCase):
         self.assertIn("encrypt_names", used)       # 只出现在 encrypt_panel.py 里
         used |= DYNAMIC_KEYS
         used |= set(core._ERRNO_KEYS.values()) | {"io_error"}
+        used |= set(core._DENIAL_KEYS.values())  # 访问被拒时按原因选用，见 core._denied
         self.assertEqual(sorted(used - set(en)), [])
 
     def test_core_errors_fill_placeholders(self) -> None:
@@ -112,6 +115,9 @@ class I18nTests(unittest.TestCase):
         # job_error_from_os 以动态 key 抛出，统一传入 path 和 err。
         for key in set(core._ERRNO_KEYS.values()) | {"io_error"}:
             self.assertLessEqual(fields(en[key]), {"path", "err"}, key)
+        # 按被拒原因选用的文案：_denied 只传 path（job_error_from_os 另外传 err）。
+        for key in core._DENIAL_KEYS.values():
+            self.assertLessEqual(fields(en[key]), {"path"}, key)
 
     def test_french_typographic_apostrophe(self) -> None:
         for key, text in self.strings["fr"].items():

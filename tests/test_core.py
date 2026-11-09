@@ -15,6 +15,7 @@ import tarfile
 import tempfile
 import threading
 import time
+from typing import Callable
 import unittest
 import urllib.parse
 from unittest.mock import patch
@@ -363,8 +364,10 @@ class ArchiveTests(unittest.TestCase):
         out = self.root / "output.tar"
         out.write_bytes(b"previous archive")
         job = core.ArchiveJob(self.root / "nonexistent", out, "tar", log=silent)
-        # 跳过开始时的源校验，让 tar 自己因为找不到源而失败。
+        # 跳过开始时的源校验和读取检查，让 tar 自己因为找不到源而失败。
         with patch.object(core, "validate_source", lambda p: Path(p)), \
+                patch.object(core, "check_source_readable",
+                             lambda p, check=None, **kw: core.SourceStats()), \
                 self.assertRaises(core.JobError) as caught:
             job.run()
         self.assertEqual(caught.exception.key, "tool_failed")
@@ -567,7 +570,9 @@ class ArchiveTests(unittest.TestCase):
         with patch.object(core.os, "replace", side_effect=denied):
             with self.assertRaises(core.JobError) as caught:
                 core.ArchiveJob(self.src, out, "tar", log=silent).run()
-        self.assertEqual(caught.exception.key, "access_denied")
+        # 没有锁定标志、不在系统保护位置的 EPERM 按隐私保护报告。
+        self.assertEqual((caught.exception.key, caught.exception.denial),
+                         ("privacy_denied", "privacy"))
         self.assertEqual(caught.exception.kw["path"], str(out))
 
     def test_os_error_after_cancel_is_cancelled(self) -> None:
@@ -590,6 +595,8 @@ class ArchiveTests(unittest.TestCase):
         gone = self.root / "ejected"
         # 模拟源在开始时的校验之后才消失，确认工具启动阶段的报错仍然正确。
         with patch.object(core, "validate_source", lambda p: Path(p)), \
+                patch.object(core, "check_source_readable",
+                             lambda p, check=None, **kw: core.SourceStats()), \
                 self.assertRaises(core.JobError) as caught:
             core.ArchiveJob(gone / "project", self.root / "out.tar", "tar", log=silent).run()
         self.assertEqual(caught.exception.key, "not_found")
@@ -875,6 +882,362 @@ class HelperTests(unittest.TestCase):
 
 
 
+class DenialTests(unittest.TestCase):
+    """访问被拒时区分原因：隐私保护、锁定、系统保护和 POSIX 权限，界面据此提供补救按钮。"""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(prefix="cleanpack-test-", dir="/tmp")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def locked(self, path: Path) -> Path:
+        """给 path 加上访达「已锁定」标志（uchg），测试结束时解除，临时目录才能删除。"""
+        os.chflags(path, stat.UF_IMMUTABLE)
+        self.addCleanup(os.chflags, path, 0)
+        return path
+
+    def unreadable(self, path: Path) -> Path:
+        """把 path（不存在时先建成文件夹）设成 0 权限，测试结束时恢复，临时目录才能删除。"""
+        if not path.exists():
+            path.mkdir()
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o700)
+        return path
+
+    def raises(self, func: Callable[..., object], *args: object) -> core.JobError:
+        with self.assertRaises(core.JobError) as caught:
+            func(*args)
+        return caught.exception
+
+    def test_classify(self) -> None:
+        plain = self.root / "plain.txt"
+        plain.write_bytes(b"")
+        classify = core.classify_denial
+        self.assertEqual(classify(plain, errno.EACCES), "posix")
+        self.assertEqual(classify(plain, None), "posix")
+        # 没有锁定标志、不在系统保护位置的 EPERM：按隐私保护处理。
+        self.assertEqual(classify(plain, errno.EPERM), "privacy")
+        self.assertEqual(classify(self.root / "new.txt", errno.EPERM), "privacy")
+        # /tmp 链接本身带 restricted 标志：直接在 /tmp 下新建时上级就是这个链接，判断前要先
+        # 解析成真实路径（/private/tmp 是普通文件夹）。
+        self.assertEqual(classify("/tmp/cleanpack-no-such-item", errno.EPERM), "privacy")
+        locked_file = self.root / "locked.txt"
+        locked_file.write_bytes(b"")
+        self.locked(locked_file)
+        self.assertEqual(classify(locked_file, errno.EPERM), "locked")
+        self.assertEqual(classify(locked_file, None), "locked")
+        # 锁定只阻止修改：读取被拒（EPERM）仍是隐私保护，EACCES 和 os.access 的读失败仍是权限。
+        self.assertEqual(classify(locked_file, errno.EPERM, write=False), "privacy")
+        self.assertEqual(classify(locked_file, None, write=False), "posix")
+        self.assertEqual(classify(locked_file, errno.EACCES), "posix")
+        # 锁定的文件夹：在其中新建看文件夹的标志；里面已有的项目只看它自己的标志。
+        locked_dir = self.root / "locked-dir"
+        locked_dir.mkdir()
+        (locked_dir / "inside.txt").write_bytes(b"")
+        self.locked(locked_dir)
+        self.assertEqual(classify(locked_dir / "new", errno.EPERM), "locked")
+        self.assertEqual(classify(locked_dir / "inside.txt", errno.EPERM), "privacy")
+        self.assertEqual(classify(locked_dir / "inside.txt", errno.EACCES), "posix")
+        if os.lstat("/System").st_flags & stat.SF_RESTRICTED:
+            self.assertEqual(classify("/System/new-item", errno.EPERM), "system")
+
+    def test_real_errors_from_locked_items(self) -> None:
+        """真实的系统调用：锁定的文件写入、锁定的文件夹作为输出，都识别为锁定。"""
+        locked_file = self.root / "locked.txt"
+        locked_file.write_bytes(b"")
+        self.locked(locked_file)
+        with self.assertRaises(PermissionError) as caught:
+            open(locked_file, "wb")
+        err = core.job_error_from_os(caught.exception)
+        self.assertEqual((err.key, err.denial, err.kw["path"]),
+                         ("locked_denied", "locked", str(locked_file)))
+        locked_dir = self.root / "locked-dir"
+        locked_dir.mkdir()
+        self.locked(locked_dir)
+        err = self.raises(core.check_output_dir, locked_dir)
+        self.assertEqual((err.key, err.denial), ("locked_denied", "locked"))
+        # 锁定的文件和文件夹都能读，作为压缩源没有问题。
+        self.assertEqual(core.validate_source(locked_file), locked_file)
+        core.check_source_readable(locked_dir)
+
+    def test_job_error_keys(self) -> None:
+        err = core.job_error_from_os(PermissionError(errno.EACCES, "Permission denied",
+                                                     str(self.root)))
+        self.assertEqual((err.key, err.denial), ("access_denied", "posix"))
+        err = core.job_error_from_os(PermissionError(errno.EPERM, "Operation not permitted",
+                                                     str(self.root)))
+        self.assertEqual((err.key, err.denial), ("privacy_denied", "privacy"))
+        # 不是权限问题的错误不带 denial，界面不提供补救按钮。
+        err = core.job_error_from_os(OSError(errno.ENOENT, "No such file", str(self.root)))
+        self.assertIsNone(err.denial)
+        self.assertIsNone(core.JobError("tool_failed", tool="tar", code=1).denial)
+
+    @unittest.skipIf(os.geteuid() == 0, "root 不受文件权限限制")
+    def test_validators_keep_the_reason(self) -> None:
+        err = self.raises(core.validate_source, self.unreadable(self.root / "unreadable"))
+        self.assertEqual((err.key, err.denial), ("src_denied", "posix"))
+        archive = self.root / "a.zip"
+        archive.write_bytes(b"")
+        err = self.raises(core.validate_archive, self.unreadable(archive))
+        self.assertEqual((err.key, err.denial), ("src_denied", "posix"))
+        # 锁定文件夹里读不了的项目是权限问题，不是“已锁定”。
+        locked_dir = self.root / "locked-dir"
+        locked_dir.mkdir()
+        inner = locked_dir / "inner.txt"
+        inner.write_bytes(b"")
+        self.unreadable(inner)
+        self.locked(locked_dir)
+        err = self.raises(core.validate_source, inner)
+        self.assertEqual((err.key, err.denial), ("src_denied", "posix"))
+        # stat 被隐私保护拒绝（EPERM）时报告隐私保护，而不是笼统的“没有权限”。
+        src = self.root / "src"
+        src.mkdir()
+        denied = PermissionError(errno.EPERM, "Operation not permitted", str(src))
+        with patch.object(core.os, "stat", side_effect=denied):
+            err = self.raises(core.validate_source, src)
+        self.assertEqual((err.key, err.denial, err.kw["path"]),
+                         ("privacy_denied", "privacy", str(src)))
+
+    def test_check_source_readable(self) -> None:
+        folder = self.root / "folder"
+        (folder / "deep" / "deeper").mkdir(parents=True)
+        (folder / "a.txt").write_bytes(b"a")
+        core.check_source_readable(folder)
+        core.check_source_readable(folder / "a.txt")
+        empty = self.root / "empty"
+        empty.mkdir()
+        core.check_source_readable(empty)
+        # 链接不跟随：指向读不了的文件夹的链接不影响检查（工具也只保存链接本身）。
+        if os.geteuid() != 0:
+            outside = self.unreadable(self.root / "outside")
+            (folder / "link").symlink_to(outside)
+            core.check_source_readable(folder)
+        # 每个文件夹调用一次 check，取消能及时生效。
+        calls: list[int] = []
+        core.check_source_readable(folder, lambda: calls.append(1))
+        self.assertEqual(len(calls), 3)
+
+    @unittest.skipIf(os.geteuid() == 0, "root 不受文件权限限制")
+    def test_check_source_readable_finds_denied_subfolders(self) -> None:
+        folder = self.root / "folder"
+        (folder / "ok").mkdir(parents=True)
+        denied = self.unreadable(folder / "ok" / "denied")
+        err = self.raises(core.check_source_readable, folder)
+        self.assertEqual((err.key, err.denial, err.kw["path"]),
+                         ("src_denied", "posix", str(denied)))
+        # 名称匹配排除规则的文件夹本来就不进归档，读不了也不影响。
+        denied.chmod(0o700)
+        self.unreadable(folder / ".Trashes")
+        core.check_source_readable(folder)
+
+    def test_check_source_readable_reports_privacy(self) -> None:
+        folder = self.root / "folder"
+        folder.mkdir()
+        denied = PermissionError(errno.EPERM, "Operation not permitted", str(folder))
+        with patch.object(core.os, "scandir", side_effect=denied):
+            err = self.raises(core.check_source_readable, folder)
+        self.assertEqual((err.key, err.denial, err.kw["path"]),
+                         ("privacy_denied", "privacy", str(folder)))
+        single = self.root / "single.txt"
+        single.write_bytes(b"x")
+        denied = PermissionError(errno.EPERM, "Operation not permitted", str(single))
+        with patch("builtins.open", side_effect=denied):
+            err = self.raises(core.check_source_readable, single)
+        self.assertEqual((err.key, err.denial, err.kw["path"]),
+                         ("privacy_denied", "privacy", str(single)))
+
+    def test_archive_job_reports_privacy_before_running_tools(self) -> None:
+        """os.access 看不出隐私保护；任务开始时实际读一遍源，被拒时不启动任何工具。"""
+        if core.locate("tar") is None:
+            self.skipTest("缺少 tar")
+        src = self.root / "src"
+        src.mkdir()
+        (src / "a.txt").write_bytes(b"a")
+        denied = PermissionError(errno.EPERM, "Operation not permitted", str(src))
+        job = core.ArchiveJob(src, self.root / "out.tar", "tar", log=silent)
+        with patch.object(core.os, "scandir", side_effect=denied), \
+                self.assertRaises(core.JobError) as caught:
+            job.run()
+        self.assertEqual((caught.exception.key, caught.exception.denial,
+                          caught.exception.kw["path"]), ("privacy_denied", "privacy", str(src)))
+        self.assertEqual(job._procs, [])
+        self.assertEqual(os.listdir(self.root), ["src"])
+
+    @unittest.skipIf(os.geteuid() == 0, "root 不受文件权限限制")
+    def test_zip_with_denied_subfolder_fails_instead_of_skipping(self) -> None:
+        """Info-ZIP 遇到读不了的子文件夹会静默跳过并报告成功，归档里少了内容；bsdtar 会以 1
+        退出，但只能报“工具失败”。开始前的检查要把它连同原因报告出来，而且不启动工具。"""
+        for fmt in ("zip", "tar"):
+            if core.locate(fmt) is None:
+                self.skipTest(f"缺少 {fmt}")
+            src = self.root / f"src-{fmt}"
+            (src / "sub").mkdir(parents=True)
+            (src / "a.txt").write_bytes(b"a")
+            (src / "sub" / "b.txt").write_bytes(b"b")
+            denied = self.unreadable(src / "sub")
+            out = self.root / f"out.{fmt}"
+            job = core.ArchiveJob(src, out, fmt, log=silent)
+            with self.assertRaises(core.JobError) as caught:
+                job.run()
+            self.assertEqual((caught.exception.key, caught.exception.denial,
+                              caught.exception.kw["path"]), ("src_denied", "posix", str(denied)))
+            self.assertEqual(job._procs, [])
+            self.assertFalse(out.exists())
+
+    def test_extract_job_reports_privacy_for_the_archive(self) -> None:
+        archive = self.root / "a.tar"
+        with tarfile.open(archive, "w") as tf:
+            tf.addfile(tarfile.TarInfo("a.txt"), io.BytesIO(b""))
+        dest = self.root / "dest"
+        dest.mkdir()
+        denied = PermissionError(errno.EPERM, "Operation not permitted", str(archive))
+        with patch.object(core, "sniff_family", side_effect=denied), \
+                self.assertRaises(core.JobError) as caught:
+            core.ExtractJob(archive, dest, log=silent).run()
+        self.assertEqual((caught.exception.key, caught.exception.denial,
+                          caught.exception.kw["path"]),
+                         ("privacy_denied", "privacy", str(archive)))
+        self.assertEqual(os.listdir(dest), [])
+        # 锁定的归档照样能读：读取被拒不能说成“已锁定”。
+        self.locked(archive)
+        with patch.object(core, "sniff_family", side_effect=denied), \
+                self.assertRaises(core.JobError) as caught:
+            core.ExtractJob(archive, dest, log=silent).run()
+        self.assertEqual((caught.exception.key, caught.exception.denial),
+                         ("privacy_denied", "privacy"))
+
+    @staticmethod
+    def fake_tool(stderr: str, code: int) -> list[str]:
+        """一个假工具：把 stderr 原样写到标准错误后以 code 退出（避免 shell 转义问题）。"""
+        return [sys.executable, "-c",
+                f"import sys; sys.stderr.write({stderr!r}); sys.exit({code})"]
+
+    EPERM_LINE = "tar: Can't open `a.txt': Operation not permitted\n"
+
+    def test_compress_tool_reporting_eperm_fails_as_privacy(self) -> None:
+        """压缩时工具报告读取被拒并失败，多半是隐私保护拦住了某些文件。"""
+        job = core.ArchiveJob(self.root, self.root / "o.tar", "tar", log=silent)
+        with self.assertRaises(core.JobError) as caught:
+            job._run_simple(self.fake_tool(self.EPERM_LINE, 1), tool="tar", cwd=self.root)
+        self.assertEqual((caught.exception.key, caught.exception.denial,
+                          caught.exception.kw["tool"]), ("privacy_partial", "privacy", "tar"))
+        # 其他失败照旧报告工具失败；成员名里恰好有这句话的行不算工具的报错。
+        for stderr in ("boom\n", "  adding: Operation not permitted\n"):
+            job = core.ArchiveJob(self.root, self.root / "o.tar", "tar", log=silent)
+            with self.assertRaises(core.JobError) as caught:
+                job._run_simple(self.fake_tool(stderr, 2), tool="tar", cwd=self.root)
+            self.assertEqual((caught.exception.key, caught.exception.denial),
+                             ("tool_failed", None), stderr)
+        # 报告了被拒但成功退出的不算失败。
+        job = core.ArchiveJob(self.root, self.root / "o.tar", "tar", log=silent)
+        job._run_simple(self.fake_tool(self.EPERM_LINE, 0), tool="tar", cwd=self.root)
+
+    def test_eperm_from_another_tool_keeps_the_real_failure(self) -> None:
+        """tar 报告过读取被拒，失败的却是压缩器（例如写满磁盘）：照实报告压缩器失败。"""
+        for tar_code, gzip_code, expected in ((0, 3, ("tool_failed", "gzip")),
+                                              (1, 0, ("privacy_partial", "tar"))):
+            job = core.ArchiveJob(self.root, self.root / "o.tar.gz", "tar.gz", log=silent)
+            with open(self.root / "out", "wb") as f, self.assertRaises(core.JobError) as caught:
+                job._run_pipeline(self.fake_tool(self.EPERM_LINE, tar_code),
+                                  [sys.executable, "-c",
+                                   f"import sys; sys.stdin.read(); sys.exit({gzip_code})"],
+                                  tools=("tar", "gzip"), cwd=self.root, stdout=f,
+                                  blame_downstream=True)
+            self.assertEqual((caught.exception.key, caught.exception.kw["tool"]), expected)
+
+    def test_eperm_formats_are_checked_per_tool(self) -> None:
+        """每个工具只按自己的格式识别读取被拒；Info-ZIP 列出成员的行以成员名结尾，名字恰好
+        是 7-Zip 汇总格式时不能把 zip 的普通失败说成隐私保护。"""
+        privacy = (("zip", "zip warning: Operation not permitted\n"),
+                   ("7z", "WARNING: errno=1 : Operation not permitted\n"),
+                   ("7z", "src/x : errno=1 : Operation not permitted\n"),
+                   ("tar", self.EPERM_LINE))
+        other = (("zip", "  adding: x : errno=1 : Operation not permitted\n"),
+                 ("zip", self.EPERM_LINE),
+                 ("7z", "src/x : errno=13 : Permission denied\n"),
+                 ("tar", "zip warning: Operation not permitted\n"))
+        for (tool, line), expected in ([(p, "privacy_partial") for p in privacy]
+                                       + [(o, "tool_failed") for o in other]):
+            job = core.ArchiveJob(self.root, self.root / "o.zip", "zip", log=silent)
+            with self.assertRaises(core.JobError) as caught:
+                job._run_simple(self.fake_tool(line, 1), tool=tool, cwd=self.root)
+            self.assertEqual(caught.exception.key, expected, (tool, line))
+
+    def test_check_source_readable_skips_overlong_paths(self) -> None:
+        """路径超过 PATH_MAX 的深层文件夹不在开始前的检查里报错：这一步按完整路径遍历，
+        bsdtar 按相对路径遍历，能归档这样的树（改动之前就能）。"""
+        src = self.root / "deep"
+        src.mkdir()
+        fd = os.open(src, os.O_RDONLY)
+        try:
+            for i in range(60):  # 60 层 × 21 个字符，超过 1024 字节
+                name = f"{i:02d}" + "d" * 19
+                os.mkdir(name, dir_fd=fd)
+                child = os.open(name, os.O_RDONLY, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            leaf = os.open("leaf.txt", os.O_CREAT | os.O_WRONLY, dir_fd=fd)
+            os.write(leaf, b"leaf")
+            os.close(leaf)
+        finally:
+            os.close(fd)
+        core.check_source_readable(src)  # 不抛出
+        if core.locate("tar") is None:
+            self.skipTest("缺少 tar")
+        out = self.root / "deep.tar"
+        core.ArchiveJob(src, out, "tar", log=silent).run()
+        with tarfile.open(out) as tf:
+            self.assertTrue(any(n.endswith("/leaf.txt") for n in tf.getnames()))
+
+    @unittest.skipIf(os.geteuid() == 0, "root 不受文件权限限制")
+    def test_check_source_readable_rejects_unenterable_folder(self) -> None:
+        """有 r 没有 x 的文件夹能列出、进不去：Info-ZIP 会静默漏掉其中的文件，要先报告。"""
+        src = self.root / "src"
+        sub = src / "nox"
+        sub.mkdir(parents=True)
+        (sub / "f.txt").write_bytes(b"f")
+        sub.chmod(0o644)
+        self.addCleanup(sub.chmod, 0o755)
+        err = self.raises(core.check_source_readable, src)
+        self.assertEqual((err.key, err.denial, err.kw["path"]), ("src_denied", "posix", str(sub)))
+
+    def test_system_protection_wording_and_access_only_checks(self) -> None:
+        """SIP：读取被拒用“不能读取”的文案，修改被拒用“不能修改”；只有 os.access 的结论
+        （没有 errno）时，带 restricted 标志的位置也按系统保护处理。"""
+        system = Path("/System")
+        if not os.lstat(system).st_flags & stat.SF_RESTRICTED:
+            self.skipTest("/System 没有 restricted 标志")
+        self.assertEqual(core.classify_denial(system, None, write=False), "system")
+        self.assertEqual(core.classify_denial(system, None, write=True), "system")
+        read = core._denied("src_denied", system, errno.EPERM, write=False)
+        write = core._denied("access_denied", system, errno.EPERM, write=True)
+        self.assertEqual((read.key, read.denial), ("system_read_denied", "system"))
+        self.assertEqual((write.key, write.denial), ("system_denied", "system"))
+        plain = self.root / "plain.txt"
+        plain.write_bytes(b"")
+        self.assertEqual(core.classify_denial(plain, None, write=False), "posix")
+
+    def test_same_location(self) -> None:
+        """按 inode 判断同一位置：大小写不同或经过符号链接也算同一个；不存在时为 False。"""
+        folder = self.root / "Folder"
+        folder.mkdir()
+        link = self.root / "link"
+        link.symlink_to(folder)
+        self.assertTrue(core.same_location(folder, link))
+        if (self.root / "folder").exists():  # 不区分大小写的卷（APFS 默认）
+            self.assertTrue(core.same_location(folder, self.root / "folder"))
+        self.assertFalse(core.same_location(folder, self.root))
+        self.assertFalse(core.same_location(folder, self.root / "missing"))
+        self.assertFalse(core.same_location(folder, None))
+
+    def test_extract_tool_eperm_is_not_privacy(self) -> None:
+        """解压只写自己的暂存目录，工具报告的 EPERM（例如不能创建设备文件）与隐私保护无关。"""
+        job = core.ExtractJob(self.root / "a.tar", self.root, log=silent)
+        with self.assertRaises(core.JobError) as caught:
+            job._run_simple(self.fake_tool(self.EPERM_LINE, 1), tool="tar", cwd=self.root)
+        self.assertEqual((caught.exception.key, caught.exception.denial), ("tool_failed", None))
+
+
 class PathInputTests(unittest.TestCase):
     """键入路径的整理、源校验和输出解析；只使用临时目录，不调用外部工具。"""
 
@@ -1036,6 +1399,212 @@ class PathInputTests(unittest.TestCase):
         for name in ("长" * 247 + ".zip", "😀" * 124 + ".zip"):
             self.assert_key("name_too_long", core.check_compress_output, self.file,
                             self.root / name)
+
+
+class ProgressTests(unittest.TestCase):
+    """压缩、解压的进度：每种格式的来源、节流与单调、解析工具输出、剩余时间的估算。"""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(prefix="cleanpack-test-", dir="/tmp")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.src = self.root / "src"
+        (self.src / "sub").mkdir(parents=True)
+        (self.src / "big.bin").write_bytes(os.urandom(3 * 1024 * 1024 + 123))
+        (self.src / "sub" / "a.txt").write_text("hello\n" * 500)
+        (self.src / ".DS_Store").write_bytes(b"junk" * 1000)
+        (self.src / "__MACOSX").mkdir()
+        (self.src / "__MACOSX" / "x").write_bytes(b"junk" * 1000)
+
+    @staticmethod
+    def recorder() -> tuple[list[tuple[str, int, int | None, str]], Callable]:
+        events: list[tuple[str, int, int | None, str]] = []
+        return events, lambda *e: events.append(e)
+
+    def setUpProgress(self) -> None:
+        """关掉节流，测试才能看到中间的进度（数据只有几 MB，节流期内就做完了）。"""
+        patcher = patch.object(core, "PROGRESS_INTERVAL", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def assert_work(self, events, unit: str = "bytes") -> list[tuple[str, int, int | None, str]]:
+        """工作阶段的进度单调不减、中间有推进（不是最后才一下补满）、最后补满总量，之后进入
+        finish。"""
+        work = [e for e in events if e[0] == "work"]
+        self.assertTrue(work, events)
+        done = [e[1] for e in work]
+        self.assertEqual(done, sorted(done))
+        total = work[-1][2]
+        self.assertIsNotNone(total)
+        self.assertEqual((done[-1], work[-1][3]), (total, unit))
+        self.assertTrue(any(0 < d < total for d in done), done)
+        self.assertEqual(events[-1][0], "finish")
+        return work
+
+    def test_source_stats(self) -> None:
+        """统计跳过垃圾项，名称以工具使用的源名称开头，tar 大小按 512 字节块估算。"""
+        (self.src / "link").symlink_to("big.bin")
+        stats = core.check_source_readable(self.src, name="./src", sizes=True)
+        big = 3 * 1024 * 1024 + 123
+        self.assertEqual(stats.total, big + 3000)
+        self.assertEqual(stats.sizes, {"./src": 0, "./src/big.bin": big, "./src/link": 0,
+                                       "./src/sub": 0, "./src/sub/a.txt": 3000})
+        blocks = sum(512 + -(-s // 512) * 512 for s in stats.sizes.values())
+        self.assertEqual((stats.entries, stats.tar_size), (5, 1024 + blocks))
+        single = core.check_source_readable(self.src / "big.bin")
+        self.assertEqual((single.total, single.entries, single.sizes), (big, 1, None))
+
+    def test_compress_progress_every_format(self) -> None:
+        self.setUpProgress()
+        cases = [(fmt, None) for fmt in core.FORMATS] + [("zip", "pw-123"), ("7z", "pw-123")]
+        for fmt, password in cases:
+            if core.missing_tools(fmt, encrypted=password is not None):
+                continue
+            with self.subTest(fmt=fmt, password=password):
+                events, cb = self.recorder()
+                out = self.root / f"out{core.FORMATS[fmt].ext}"
+                core.ArchiveJob(self.src, out, fmt, log=silent, password=password,
+                                progress=cb).run()
+                self.assertEqual(events[0][0], "scan")
+                work = self.assert_work(events)
+                self.assertGreater(work[-1][2], 3 * 1024 * 1024)
+                out.unlink()
+
+    def test_extract_progress_every_format(self) -> None:
+        self.setUpProgress()
+        for fmt in core.FORMATS:
+            if core.missing_tools(fmt):  # 解压需要的工具是压缩所需的子集
+                continue
+            with self.subTest(fmt=fmt):
+                archive = self.root / f"a{core.FORMATS[fmt].ext}"
+                core.ArchiveJob(self.src, archive, fmt, log=silent).run()
+                dest = self.root / f"dest-{fmt}"
+                dest.mkdir()
+                events, cb = self.recorder()
+                core.ExtractJob(archive, dest, log=silent, progress=cb).run()
+                self.assertEqual(events[0][0], "prepare")
+                unit = "items" if fmt == "7z" else "bytes"
+                work = self.assert_work(events, unit)
+                size = archive.stat().st_size
+                expected = {"tar.zst": 2 * size, "zip": 3 * 1024 * 1024 + 123 + 3000,
+                            "7z": 4}.get(fmt, size)
+                self.assertEqual(work[-1][2], expected)
+                if fmt == "tar.zst":  # 第二遍（真正解压）也在计数，不是校验完就停住
+                    self.assertTrue(any(size < e[1] < 2 * size for e in work), work)
+
+    def test_encrypted_zip_extraction_has_no_verbose_listing(self) -> None:
+        """有密码时不加 -v（密码提示会粘在名称后面），进度不确定，但照常解出。"""
+        if core.missing_tools("zip", encrypted=True):
+            self.skipTest("缺少 tar")
+        archive = self.root / "enc.zip"
+        core.ArchiveJob(self.src, archive, "zip", log=silent, password="pw-123").run()
+        dest = self.root / "dest"
+        dest.mkdir()
+        events, cb = self.recorder()
+        lines: list[str] = []
+        core.ExtractJob(archive, dest, log=lines.append, password="pw-123", progress=cb).run()
+        self.assertFalse(any(" -v " in line for line in lines if line.startswith("$ ")))
+        self.assertIn(("work", 0, None, "bytes"), events)
+
+    def test_throttle_and_monotonic(self) -> None:
+        events, cb = self.recorder()
+        p = core._Progress(cb)
+        p.start("work", 100)
+        p.update(10)          # 刚开始阶段，节流期内不通知
+        p.update(5)           # 倒退的值忽略
+        p.update(500)         # 超过总量的按总量算
+        self.assertEqual(p.done, 100)
+        self.assertEqual(events, [("work", 0, 100, "bytes")])
+        time.sleep(core.PROGRESS_INTERVAL + 0.02)
+        p.start("finish")
+        p.complete()
+        self.assertEqual(events[-2:], [("finish", 0, None, "bytes")] * 2)
+        core._Progress(None).update(1)  # 没有回调时什么也不做
+
+    def test_estimator(self) -> None:
+        est = core.ProgressEstimator(now=0.0)
+        self.assertEqual(est.update(0, 1000, 0.0), (None, None))
+        self.assertEqual(est.update(50, 1000, 0.01), (None, None))  # 数据太少，不给速度
+        self.assertEqual(est.update(100, 1000, 1.0)[1], None)  # 还在预热
+        rate, eta = est.update(300, 1000, 3.0)
+        self.assertAlmostEqual(rate, 100.0)
+        self.assertAlmostEqual(eta, 7.0)
+        rate2, eta2 = est.update(300, 1000, 6.0)  # 停住三秒：速度下降，剩余时间变长
+        self.assertLess(rate2, rate)
+        self.assertGreater(eta2, eta)
+        self.assertEqual(est.update(10, 1000, 7.0), (rate2, None))  # 新阶段重新开始
+        self.assertIsNone(core.ProgressEstimator(0.0).update(5, None, 9.0)[1])
+
+    def test_eta_parts(self) -> None:
+        self.assertEqual(core.eta_parts(0.4), (0, 0, 5))
+        self.assertEqual(core.eta_parts(41), (0, 0, 45))
+        self.assertEqual(core.eta_parts(64), (0, 1, 0))
+        self.assertEqual(core.eta_parts(125), (0, 2, 0))
+        self.assertEqual(core.eta_parts(3725), (1, 2, 0))
+
+    def test_tool_output_parsers(self) -> None:
+        """7-Zip 的百分比要求后面紧跟退格（成员名里的「50%」不算）；退格覆盖的部分不进日志；
+        -v 只认得已知的名称，粘在名称后的密码提示去掉，报错行照常记日志。"""
+        out = (b"  0%\x08\x08\x08\x08    \x08\x08\x08\x08+ src/50% off.txt\n"
+               b" 75% 1\x08\x08\x08\x08\x08\x08      \x08\x08\x08\x08\x08\x08+ src/b\n")
+        self.assertEqual([int(m) for m in core._SEVENZIP_PERCENT.findall(out)], [0, 75])
+        self.assertEqual(core._strip_backspaces("  0%\x08\x08\x08\x08    \x08\x08\x08\x08+ a"),
+                         "+ a")
+        self.assertEqual(core._strip_backspaces(" 75% 2\x08\x08\x08\x08\x08\x08  \x08\x08"), "")
+        self.assertEqual(core._strip_backspaces("+ plain"), "+ plain")
+
+        logged: list[str] = []
+        events, cb = self.recorder()
+        job = core.ArchiveJob(self.src, self.root / "o.zip", "zip", log=logged.append,
+                              progress=cb)
+        job._track_verbose("a ", {"src": 0, "src/a b": 10, "src/c": 5}, 15)
+        job._note_pending(b"a src/a b")
+        self.assertEqual(job._current, "src/a b")
+        job._emit_line(b"a src/a bEnter passphrase:", "tar")
+        job._emit_line(b"a src/a b: Can't open", "tar")   # 不是已知名称：照常记日志
+        job._emit_line(b"a src/c", "tar")
+        self.assertEqual((job._verbose_done, logged), (15, ["a src/a b: Can't open"]))
+        self.assertEqual(job._progress.done, 15)
+        job._verbose = None
+        job._emit_line(b"  0%\x08\x08\x08\x08    \x08\x08\x08\x08+ src/b", "7z")
+        job._emit_line(b" 75% 2\x08\x08\x08\x08\x08\x08      \x08\x08\x08\x08\x08\x08", "7z")
+        self.assertEqual(logged[1:], ["+ src/b"])  # 只剩进度的行不记日志
+
+        # 7-Zip 的百分比被切在两个数据块之间也能读到
+        job._progress.start("work", 200)
+        watch = job._percent_watcher(lambda pct: pct * 2)
+        watch(b" 4")
+        watch(b"2%\x08\x08\x08")
+        self.assertEqual(job._progress.done, 84)
+
+    def test_relay_keeps_blame_and_reports_write_errors(self) -> None:
+        """经中转线程连接时，归因与直接相连相同；写输出文件失败（例如磁盘已满）照实报告。"""
+        upstream = [sys.executable, "-c",
+                    "import sys\nfor _ in range(64): sys.stdout.buffer.write(b'x' * 65536)"]
+        failing = [sys.executable, "-c", "import sys; sys.stdin.buffer.read(10); sys.exit(3)"]
+        seen: list[int] = []
+        job = core.ArchiveJob(self.src, self.root / "o.tar.gz", "tar.gz", log=silent)
+        with open(self.root / "out", "wb") as f, self.assertRaises(core.JobError) as caught:
+            job._run_pipeline(upstream, failing, tools=("tar", "gzip"), cwd=self.root,
+                              stdout=f, blame_downstream=True, meter=seen.append)
+        self.assertEqual(caught.exception.kw["tool"], "gzip")
+        bad_tar = [sys.executable, "-c", "import sys; sys.stdout.write('ab'); sys.exit(2)"]
+        cat = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"]
+        seen.clear()
+        job = core.ArchiveJob(self.src, self.root / "o.tar.gz", "tar.gz", log=silent)
+        with open(self.root / "out", "wb") as f, self.assertRaises(core.JobError) as caught:
+            job._run_pipeline(bad_tar, cat, tools=("tar", "gzip"), cwd=self.root,
+                              stdout=f, blame_downstream=True, meter=seen.append)
+        self.assertEqual((caught.exception.kw["tool"], seen), ("tar", [2]))
+        self.assertEqual((self.root / "out").read_bytes(), b"ab")
+
+        class Full(io.BytesIO):
+            def write(self, data: bytes) -> int:
+                raise OSError(errno.ENOSPC, "No space left on device")
+        job = core.ArchiveJob(self.src, self.root / "o.tar", "tar", log=silent)
+        with self.assertRaises(OSError) as raised:
+            job._run_simple(upstream, tool="tar", cwd=self.root, stdout=Full(), meter=seen.append)
+        self.assertEqual(raised.exception.errno, errno.ENOSPC)
 
 
 if __name__ == "__main__":

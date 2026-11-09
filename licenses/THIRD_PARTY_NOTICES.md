@@ -14,6 +14,7 @@ below are included in this folder.
 | Libraries used by the Python runtime (OpenSSL `libcrypto`, libffi, zlib, bzip2, liblzma, mpdecimal, expat, SQLite) | OpenSSL: Apache-2.0; the others: MIT-, BSD-style or public-domain licenses, listed by Python | `Apache-2.0.txt` (OpenSSL) | https://docs.python.org/3/license.html |
 | PyInstaller bootloader | GPL-2.0-or-later with the PyInstaller bootloader exception, which permits distributing the bootloader with applications under any license | — | https://github.com/pyinstaller/pyinstaller |
 | PyInstaller run-time hooks embedded in the executable | Apache-2.0 | `Apache-2.0.txt` | https://github.com/pyinstaller/pyinstaller |
+| Material Symbols icons (Outlined, 24 px SVGs in `assets/icons`, recolored at run time), published by Google | Apache-2.0 | `Apache-2.0.txt` | https://github.com/google/material-design-icons (commit 10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7) |
 
 The GNU Lesser General Public License version 3 builds on the GNU General Public
 License version 3, so both texts are included. The build excludes Qt modules that

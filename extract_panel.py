@@ -8,7 +8,8 @@ from PySide6.QtWidgets import (QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
                                QPushButton, QVBoxLayout, QWidget)
 
 import core
-from gui_common import NOTE_STYLE, PathInput
+import theme
+from gui_common import PathInput
 from i18n import tr
 
 # 文件对话框的过滤器：只列出支持的归档扩展名。
@@ -19,8 +20,14 @@ class ExtractPanel(QWidget):
     """管理要解压的归档和目标文件夹；状态或有效性变化时发出 changed，由主窗口刷新按钮和横幅。
 
     目标文件夹留空时使用归档所在的文件夹。拖放由主窗口转交给 set_archive。
+
+    面板本身只装「归档」卡片；「解压」卡片 ext_box 由主窗口放进与压缩选项卡片共用的
+    QStackedWidget，两种模式的第二张卡片因此一样高，切换模式时布局不动。
     """
     changed = Signal()
+    # 路径框旁的补救按钮被点按：参数是带 denial 的 JobError 和框的名称（archive 或 dest），
+    # 由主窗口统一处理（重新选择或在访达中显示）。
+    fix_requested = Signal(object, str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -29,7 +36,7 @@ class ExtractPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._build_archive_group())
-        layout.addWidget(self._build_extract_group())
+        self._build_extract_group()  # 由主窗口放置，见类文档
 
     # ---------------- 界面 ----------------
     def _build_archive_group(self) -> QGroupBox:
@@ -42,11 +49,13 @@ class ExtractPanel(QWidget):
         self.arc_input.checked.connect(self._update_format_label)
         self.arc_input.checked.connect(self.changed)
         self.btn_archive = QPushButton()
+        theme.set_icon(self.btn_archive, "folder_open")
         self.btn_archive.clicked.connect(self.choose_archive)
+        self.arc_input.fix_requested.connect(lambda err: self.fix_requested.emit(err, "archive"))
         h.addWidget(self.arc_input, 1)
         h.addWidget(self.btn_archive)
         v.addLayout(h)
-        v.addWidget(self.arc_input.hint)
+        v.addWidget(self.arc_input.hint_row)
         return self.arc_box
 
     def _build_extract_group(self) -> QGroupBox:
@@ -60,19 +69,23 @@ class ExtractPanel(QWidget):
         self.dest_input.committed.connect(self.on_dest_committed)
         self.dest_input.checked.connect(self.changed)
         self.btn_dest = QPushButton()
+        theme.set_icon(self.btn_dest, "folder_open")
         self.btn_dest.clicked.connect(self.choose_dest)
+        self.dest_input.fix_requested.connect(lambda err: self.fix_requested.emit(err, "dest"))
         g.addWidget(self.dest_lbl, 1, 0)
         g.addWidget(self.dest_input, 1, 1)
         g.addWidget(self.btn_dest, 1, 2)
-        g.addWidget(self.dest_input.hint, 2, 1, 1, 2)
+        g.addWidget(self.dest_input.hint_row, 2, 1, 1, 2)
         self.layout_note = QLabel()
         self.skipped_lbl = QLabel()
         for lbl in (self.layout_note, self.skipped_lbl):
             lbl.setWordWrap(True)
-            lbl.setStyleSheet(NOTE_STYLE)
+            theme.set_role(lbl, "note")
         g.addWidget(self.layout_note, 3, 0, 1, 3)
         g.addWidget(self.skipped_lbl, 4, 0, 1, 3)
         g.setColumnStretch(1, 1)
+        # 卡片与压缩选项卡片一样高，多出的空间留在底部，内容保持靠上。
+        g.setRowStretch(5, 1)
         return self.ext_box
 
     def retranslate(self) -> None:
@@ -97,8 +110,14 @@ class ExtractPanel(QWidget):
             self.arc_input.submit(path)
 
     def choose_archive(self) -> None:
+        self.pick_archive("")
+
+    def pick_archive(self, start: str) -> None:
+        """在原生面板里选择归档，start 是面板一开始显示的位置。重新选中被隐私保护拦住的
+        归档也走这里：在系统提供的面板里亲自选择，就是 macOS 认可的授权。"""
         filters = f"{tr('archive_group')} ({ARCHIVE_PATTERNS})"
-        self.set_archive(QFileDialog.getOpenFileName(self, tr("choose_archive"), "", filters)[0])
+        self.set_archive(QFileDialog.getOpenFileName(self, tr("choose_archive"), start,
+                                                     filters)[0])
 
     @staticmethod
     def _parse_archive(text: str) -> Path | None:
@@ -166,12 +185,25 @@ class ExtractPanel(QWidget):
         return archive.parent if archive is not None else None
 
     def choose_dest(self) -> None:
-        """在对话框里选择目标。显式选择总是生效，即使选的正是当前默认显示的文件夹，
-        这样换归档后它也会保留。"""
-        start = self.dest_path()
+        self.pick_dest(None)
+
+    def pick_dest(self, start: Path | None, *, regrant: bool = False) -> None:
+        """在对话框里选择目标，start 为 None 时从当前目标开始。显式选择总是生效，即使选的
+        正是当前默认显示的文件夹，这样换归档后它也会保留。
+
+        regrant 表示只是为了授权而重新选择被拒的目标：选的仍是默认的（归档所在的）文件夹时
+        保持「跟随归档」，不把它变成选过的目标。
+        """
+        start = start or self.dest_path()
         folder = QFileDialog.getExistingDirectory(self, tr("dest"), str(start or ""))
         if folder:
-            self.dest_dir = core.parse_folder(folder)
+            chosen = core.parse_folder(folder)
+            # 按 inode 比较：面板返回的写法可能与键入的不同（大小写、经过符号链接）。
+            if regrant and self.dest_dir is None and core.same_location(chosen, self.dest_path()):
+                self.refresh_note()
+                self.changed.emit()
+                return
+            self.dest_dir = chosen
             # 对话框的选择优先于框里还没提交的草稿：直接显示所选文件夹，草稿作废。
             self.dest_input.display(str(self.dest_dir))
             self.changed.emit()

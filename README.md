@@ -14,7 +14,7 @@ CleanPack is a desktop archiving tool built with Python and PySide6. Select or d
 - **Extract mode** for the same six formats: junk files are skipped, a single top-level file or folder goes straight into the destination folder, and nothing is ever overwritten (existing names get a number, as in Finder).
 - **Password protection** for zip (AES-256, or ZipCrypto for compatibility) and 7z (AES-256, with file names encrypted by default). Encrypted archives ask for their password when you extract them.
 - Detects compression tools and warns when the selected format needs a missing one; at startup it also points out a missing Homebrew if a tool still needs it. The Toolchain window (header button or **Tools ▸ Toolchain…**) shows tool paths, the Homebrew command, a one-click install with live logs, and keeps installing in the background if you close it.
-- Offers English, Simplified Chinese, Traditional Chinese, and French interfaces, with support for system light and dark appearance.
+- Offers English, Simplified Chinese, Traditional Chinese, and French interfaces in a Material Design 3 style. The appearance follows the system, or can be set to light or dark under **View ▸ Appearance**.
 - Replaces the output atomically on success. On failure or cancellation, it cleans up temporary files and preserves existing output. It also prevents overwriting the source file or placing the output inside the source folder.
 
 ## Supported formats
@@ -70,7 +70,7 @@ If Homebrew is missing, the app provides installation instructions. It does not 
 3. Click **Compress**. If the output file already exists, the app asks before replacing it.
 4. When compression finishes, click **Show in Finder** to locate the archive.
 
-The app processes one input item at a time. To archive multiple files, place them in a folder first. The interface shows when a task is running but does not display a progress percentage.
+The app processes one input item at a time. To archive multiple files, place them in a folder first. While a task runs, a progress bar shows the percentage, speed, and estimated time left. Progress is tracked by bytes for most formats, by file when creating an encrypted zip, and it is shown without a percentage when extracting a password-protected zip.
 
 ### Encryption
 
@@ -88,6 +88,12 @@ Passwords are handed to the compression tools on standard input, never on the co
 3. Click **Extract**. If the archive is encrypted, CleanPack asks for its password, and asks again if it is wrong.
 
 A single top-level file or folder is placed directly in the destination; otherwise everything goes into a folder named after the archive. Symbolic links that point outside the extracted items are kept, and the log lists them. If the archive came from the internet, the extracted items keep its "downloaded" mark (except on volumes such as exFAT, where the log says so).
+
+### Access to protected folders
+
+macOS privacy protection can stop CleanPack from reading the Desktop, Documents and Downloads folders, external drives, network volumes and other protected locations. CleanPack checks the source before it starts and, if access is denied, explains why: click **Grant Access…** to choose the item again in the Open panel, which lets CleanPack open it, or **Open System Settings** to turn on CleanPack in **Privacy & Security ▸ Files & Folders**. If an item is locked or its permissions don't allow access, CleanPack offers **Show in Finder** instead, so you can change it in Get Info.
+
+Because the app is not signed with a Developer ID, macOS may treat each new version as a different app, so you may need to allow it again after updating. When CleanPack runs from source, macOS checks the app that started it, such as Terminal.
 
 ## Build the macOS app
 
@@ -117,7 +123,10 @@ main.py             Main window and task coordination
 extract_panel.py    Extract mode: archive and destination inputs
 encrypt_panel.py    Password options for compression
 tools_dialog.py     Toolchain window, tool detection, and Homebrew installation
-gui_common.py       Shared Qt helpers: styles, Qt translations, localized numbers, dialogs
+gui_common.py       Shared Qt helpers: Qt translations, localized numbers, dialogs
+theme.py            Material 3 theme: style, palette, style sheet, switch, icons
+theme_tokens.py     Material 3 color, type, and shape tokens
+assets/icons/       Material Symbols icons used by the interface
 core.py             Archiving core, independent of Qt
 i18n.py             Interface strings in four languages
 requirements.txt    Runtime dependencies

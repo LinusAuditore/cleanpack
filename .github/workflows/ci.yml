@@ -62,7 +62,8 @@ jobs:
       - name: Offscreen GUI fixtures
         run: |
           for f in tests/gui/gui_stage4_check.py tests/gui/gui_stage5_check.py \
-                   tests/gui/gui_stage6_check.py tests/gui/gui_stage6b_check.py; do
+                   tests/gui/gui_stage6_check.py tests/gui/gui_stage6b_check.py \
+                   tests/gui/gui_permission_check.py tests/gui/gui_theme_check.py; do
             echo "::group::$f"
             python -B "$f"
             echo "::endgroup::"

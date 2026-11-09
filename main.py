@@ -1,22 +1,28 @@
 """CleanPack GUI（PySide6）：压缩与解压两种模式。运行：python3 main.py"""
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QLocale, QObject, QProcess, QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QGuiApplication
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog,
+from PySide6.QtGui import (QAction, QActionGroup, QCloseEvent, QDragEnterEvent, QDropEvent,
+                           QGuiApplication)
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QMenuBar, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QSlider, QTabBar, QVBoxLayout,
-                               QWidget)
+                               QProgressBar, QPushButton, QSlider, QStackedWidget,
+                               QVBoxLayout, QWidget)
 
 import core
-from gui_common import (NOTE_STYLE, WARN_STYLE, PathInput, ask_password, confirm, format_secs,
-                        format_size, install_qt_translator, process_environment)
+import theme
+from core import ProgressEstimator
+from gui_common import (PROGRESS_SEP, PathInput, ask_password, confirm, format_progress,
+                        format_secs, format_size, install_qt_translator, open_privacy_settings,
+                        privacy_help, process_environment)
 from encrypt_panel import EncryptPanel
 from extract_panel import ExtractPanel
 from i18n import LANGS, current_lang, detect_lang, set_lang, tr
@@ -28,12 +34,15 @@ DEFAULT_FORMAT = "zip"
 MODES = ("compress", "extract")
 # 解压任务因这些原因失败时询问密码，带密码重试，而不是报告失败。
 PASSWORD_ERRORS = ("archive_encrypted", "archive_wrong_password", "archive_password_or_damaged")
+# 访问被拒时有补救按钮的原因（见 core.classify_denial）；system 只能说明，没有补救办法。
+_DENIAL_ACTIONS = ("privacy", "posix", "locked")
 
 
 class Bridge(QObject):
     """后台线程 -> 主线程 的信号桥。"""
     log = Signal(str)
     done = Signal(object, object)  # (Path | None, Exception | None)
+    progress = Signal(str, object, object, str)  # (阶段, 已完成, 总量或 None, 单位)，见 core._Progress
 
 
 class MainWindow(QWidget):
@@ -60,6 +69,13 @@ class MainWindow(QWidget):
         # 跨线程信号由 Qt 排队到主线程，工作线程不能直接修改控件。
         self.bridge.log.connect(self.append_log)
         self.bridge.done.connect(self.on_job_done)
+        self.bridge.progress.connect(self.on_progress)
+        # 最近一次进度，以及据此估算速度和剩余时间；进度一段时间没变时由定时器再估算一次。
+        self._last_progress: tuple[str, int, int | None, str] = ("", 0, None, "bytes")
+        self._estimator = ProgressEstimator(time.monotonic())
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(1000)
+        self._progress_timer.timeout.connect(self._refresh_progress)
 
         self.tools = ToolchainController(self)
         self.tools_dialog = ToolsDialog(self.tools, self)
@@ -77,6 +93,8 @@ class MainWindow(QWidget):
         self.retranslate()
         mode = self.settings.value("mode")
         self.mode_tabs.setCurrentIndex(MODES.index(mode) if mode in MODES else 0)
+        # 也把焦点放在当前模式的路径框（_focus_mode_field）：否则 Qt 交给第一个可获得焦点的
+        # 控件（工具链按钮），M3 的焦点描边会让它看起来像被选中了。
         self.on_mode_changed()
         # 在终端里装好工具后切回应用，横幅应自动更新，不必打开工具链窗口。
         QGuiApplication.instance().applicationStateChanged.connect(self.on_app_state_changed)
@@ -86,47 +104,62 @@ class MainWindow(QWidget):
     def _build(self) -> None:
         """按视觉顺序组装界面；各分组负责创建自己的控件和信号连接。"""
         root = QVBoxLayout(self)
+        root.setContentsMargins(16, 12, 16, 16)
+        root.setSpacing(8)
         root.addLayout(self._build_header())
         root.addLayout(self._build_mode_bar())
         root.addWidget(self._build_source_group())
-        root.addWidget(self._build_options_group())
         self.extract_panel = ExtractPanel()
         self.extract_panel.changed.connect(self.update_go_state)
+        self.extract_panel.fix_requested.connect(self.fix_access)
         root.addWidget(self.extract_panel)
+        root.addWidget(self._build_mode_cards())
         root.addWidget(self._build_log_group(), 1)
-        root.addLayout(self._build_banner())
+        root.addWidget(self._build_banner())
         root.addLayout(self._build_actions())
+        # 路径框下的提示（以及补救按钮）出现后内容变高；等布局更新完再按需加高窗口，否则
+        # 自动换行的说明会被压扁、互相重叠。
+        for field in (self.src_input, self.out_input):
+            field.checked.connect(self._schedule_grow)
+        self.extract_panel.changed.connect(self._schedule_grow)
 
     def _build_header(self) -> QHBoxLayout:
-        """构建标题、语言选择器和工具链入口，返回顶部布局。"""
+        """构建顶栏第一行：标题、语言选择器和工具链入口，返回布局。
+
+        模式切换单独占第二行（_build_mode_bar）。标题只是应用名（用户决定，不加副标题，
+        也不翻译）。「语言」标签不再显示，文字只作为下拉框的无障碍名称（用户决定）。
+        """
         top = QHBoxLayout()
-        self.title_lbl = QLabel()
-        f = self.title_lbl.font()
-        f.setPointSize(f.pointSize() + 4)
-        f.setBold(True)
-        self.title_lbl.setFont(f)
-        self.lang_lbl = QLabel()
+        self.title_lbl = QLabel(core.APP_NAME)
+        theme.set_role(self.title_lbl, "title")
+        self.lang_lbl = QLabel(self)
+        self.lang_lbl.hide()
         self.lang_combo = QComboBox()
+        # 在 macOS 上，Qt 给下拉框的无障碍名称是当前选项（“English”），不用 accessibleName；
+        # 隐藏的标签作为它的伙伴，辅助功能仍能把「语言」与下拉框关联起来。
+        self.lang_lbl.setBuddy(self.lang_combo)
         for code, name in LANGS:
             self.lang_combo.addItem(name, code)
         self.lang_combo.setCurrentIndex([c for c, _ in LANGS].index(current_lang()))
         self.lang_combo.currentIndexChanged.connect(self.on_lang_changed)
         self.btn_tools = QPushButton()
+        theme.set_button(self.btn_tools, "tonal")
+        theme.set_icon(self.btn_tools, "build")
         self.btn_tools.clicked.connect(self.open_tools)
-        top.addWidget(self.title_lbl)
-        top.addStretch()
-        top.addWidget(self.lang_lbl)
+        top.addWidget(self.title_lbl, 1)
         top.addWidget(self.lang_combo)
         top.addWidget(self.btn_tools)
         return top
 
     def _build_mode_bar(self) -> QHBoxLayout:
-        """构建居中的「压缩 | 解压」模式切换，返回布局；切换时只显示当前模式的分组。"""
+        """构建居中的「压缩 | 解压」模式切换（M3 分段按钮，选中的一段用底色区分），返回
+        布局；切换时只显示当前模式的分组。"""
         bar = QHBoxLayout()
-        self.mode_tabs = QTabBar()
+        self.mode_tabs = theme.SegmentedTabBar()
         for _ in MODES:
             self.mode_tabs.addTab("")
         self.mode_tabs.setDrawBase(False)
+        self.mode_tabs.setExpanding(False)
         self.mode_tabs.currentChanged.connect(self.on_mode_changed)
         bar.addStretch()
         bar.addWidget(self.mode_tabs)
@@ -134,12 +167,32 @@ class MainWindow(QWidget):
         return bar
 
     def _build_menu(self) -> None:
-        """在 macOS 菜单栏加入「工具 ▸ 工具链…」；无父对象的 QMenuBar 会成为全局菜单栏。"""
+        """在 macOS 菜单栏加入「显示 ▸ 外观」和「工具 ▸ 工具链…」；无父对象的 QMenuBar
+        会成为全局菜单栏。"""
         self.menu_bar = QMenuBar(None)
+        self.view_menu = self.menu_bar.addMenu("")
+        self.appearance_menu = self.view_menu.addMenu("")
+        # 三个选项互斥，勾选的是保存的偏好（main() 启动时已按它设置好外观）。
+        group = QActionGroup(self)
+        current = appearance_pref(self.settings)
+        self.appearance_actions: dict[str, QAction] = {}
+        for mode in theme.APPEARANCES:
+            act = QAction(self, checkable=True)
+            act.setMenuRole(QAction.MenuRole.NoRole)  # 不让 Qt 按文字把它挪进应用菜单
+            act.setChecked(mode == current)
+            act.triggered.connect(lambda _c=False, m=mode: self.on_appearance_chosen(m))
+            group.addAction(act)
+            self.appearance_menu.addAction(act)
+            self.appearance_actions[mode] = act
         self.tools_menu = self.menu_bar.addMenu("")
         self.tools_action = QAction(self)
         self.tools_action.triggered.connect(self.open_tools)
         self.tools_menu.addAction(self.tools_action)
+
+    def on_appearance_chosen(self, mode: str) -> None:
+        """「显示 ▸ 外观」里选了一项：立即切换并保存。"""
+        self.settings.setValue("appearance", mode)
+        theme.set_appearance(QApplication.instance(), mode)
 
     def _build_source_group(self) -> QGroupBox:
         """构建可键入的源路径框和选择按钮，校验提示显示在路径框之后，返回源文件分组。"""
@@ -149,15 +202,17 @@ class MainWindow(QWidget):
         self.src_input = PathInput(self._parse_source)
         self.src_input.committed.connect(self.on_source_committed)
         self.src_input.checked.connect(self.update_go_state)
+        self.src_input.fix_requested.connect(lambda err: self.fix_access(err, "source"))
         self.btn_folder = QPushButton()
         self.btn_file = QPushButton()
+        theme.set_icon(self.btn_folder, "folder_open")
         self.btn_folder.clicked.connect(self.choose_folder)
         self.btn_file.clicked.connect(self.choose_file)
         h.addWidget(self.src_input, 1)
         h.addWidget(self.btn_folder)
         h.addWidget(self.btn_file)
         v.addLayout(h)
-        v.addWidget(self.src_input.hint)
+        v.addWidget(self.src_input.hint_row)
         return self.src_box
 
     def _build_options_group(self) -> QGroupBox:
@@ -191,9 +246,9 @@ class MainWindow(QWidget):
 
         self.level_note = QLabel()
         self.level_note.setWordWrap(True)
-        self.level_note.setStyleSheet(NOTE_STYLE)
+        theme.set_role(self.level_note, "note")
         g.addWidget(self.level_note, 2, 1, 1, 4)
-        self.extreme_chk = QCheckBox()
+        self.extreme_chk = theme.Switch()
         g.addWidget(self.extreme_chk, 3, 1, 1, 4)
 
         self.encrypt_panel = EncryptPanel(self)
@@ -206,19 +261,33 @@ class MainWindow(QWidget):
         self.out_input = PathInput(self._parse_output)
         self.out_input.committed.connect(self.on_output_committed)
         self.out_input.checked.connect(self.update_go_state)
+        self.out_input.fix_requested.connect(lambda err: self.fix_access(err, "output"))
         self.btn_save = QPushButton()
         self.btn_save.clicked.connect(self.choose_output)
         g.addWidget(self.out_lbl, row, 0)
         g.addWidget(self.out_input, row, 1, 1, 3)
         g.addWidget(self.btn_save, row, 4)
-        g.addWidget(self.out_input.hint, row + 1, 1, 1, 4)
+        g.addWidget(self.out_input.hint_row, row + 1, 1, 1, 4)
 
         self.excl_lbl = QLabel()
         self.excl_lbl.setWordWrap(True)
-        self.excl_lbl.setStyleSheet(NOTE_STYLE)
+        theme.set_role(self.excl_lbl, "note")
         g.addWidget(self.excl_lbl, row + 2, 0, 1, 5)
         g.setColumnStretch(2, 1)
+        # 与解压卡片叠放（_build_mode_cards），较高的一页决定高度；多出的空间留在底部。
+        g.setRowStretch(row + 3, 1)
         return self.opt_box
+
+    def _build_mode_cards(self) -> QStackedWidget:
+        """把两种模式的第二张卡片（压缩选项、解压设置）叠放在一个 QStackedWidget 里，返回它。
+
+        叠放控件的高度取两页中较高的一页，所以两种模式的这张卡片一样高，切换模式时日志区
+        和窗口都不变（用户要求，2026-11-09）。较矮的一页多出的空间留在卡片底部。
+        """
+        self.mode_cards = QStackedWidget()
+        self.mode_cards.addWidget(self._build_options_group())
+        self.mode_cards.addWidget(self.extract_panel.ext_box)
+        return self.mode_cards
 
     def _build_log_group(self) -> QGroupBox:
         """构建只读日志区，返回日志分组。"""
@@ -228,34 +297,54 @@ class MainWindow(QWidget):
         self.log_view.setReadOnly(True)
         self.log_view.setAcceptDrops(False)
         self.log_view.setMaximumBlockCount(3000)
+        # 日志分到的是剩余空间；默认最小高度偏大，内容多（打开加密）时会把窗口撑得太高。
+        self.log_view.setMinimumHeight(40)
         lv.addWidget(self.log_view)
         return self.log_box
 
-    def _build_banner(self) -> QHBoxLayout:
-        """构建工具链横幅：只在当前格式缺工具或正在安装时显示，按钮打开工具链窗口。"""
-        banner = QHBoxLayout()
+    def _build_banner(self) -> QFrame:
+        """构建工具链横幅（M3 banner：警告图标、说明和文字按钮）：只在当前格式缺工具或
+        正在安装时显示，按钮打开工具链窗口。"""
+        self.banner = QFrame()
+        theme.set_role(self.banner, "banner")
+        banner = QHBoxLayout(self.banner)
+        banner.setContentsMargins(16, 8, 8, 8)
+        banner.setSpacing(12)
+        self.banner_icon = QLabel()
+        theme.set_label_icon(self.banner_icon, "warning", "error")
         self.warn_lbl = QLabel()
-        self.warn_lbl.setStyleSheet(WARN_STYLE)
         self.warn_lbl.setWordWrap(True)
         self.banner_btn = QPushButton()
+        theme.set_button(self.banner_btn, "text")
         self.banner_btn.clicked.connect(self.open_tools)
+        banner.addWidget(self.banner_icon, 0, Qt.AlignmentFlag.AlignTop)
         banner.addWidget(self.warn_lbl, 1)
         banner.addWidget(self.banner_btn)
-        return banner
+        self.banner.hide()
+        return self.banner
 
     def _build_actions(self) -> QHBoxLayout:
-        """构建进度条与任务操作按钮，返回底部布局。"""
+        """构建进度条、进度说明与任务操作按钮，返回底部布局。主按钮是实心按钮（M3 每屏一个
+        主操作）。进度条有总量时是确定进度，否则是不确定的忙碌条；说明文字见 format_progress。"""
         bottom = QHBoxLayout()
+        bottom.setSpacing(8)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
         self.progress.setVisible(False)
+        self.progress_lbl = QLabel()
+        theme.set_role(self.progress_lbl, "note")
+        self.progress_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.progress_lbl.setVisible(False)
         self.btn_cancel = QPushButton()
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self.cancel_job)
         self.btn_go = QPushButton()
+        theme.set_button(self.btn_go, "filled")
         self.btn_go.setDefault(True)
         self.btn_go.clicked.connect(self.start)
         bottom.addWidget(self.progress, 1)
+        bottom.addWidget(self.progress_lbl)
         bottom.addWidget(self.btn_cancel)
         bottom.addWidget(self.btn_go)
         return bottom
@@ -263,10 +352,14 @@ class MainWindow(QWidget):
     def retranslate(self) -> None:
         """按当前语言刷新界面，保留路径、日志和正在运行的任务。"""
         self.setWindowTitle(core.APP_NAME)
-        self.title_lbl.setText(tr("title"))
         self.lang_lbl.setText(tr("language"))
+        self.lang_combo.setAccessibleName(tr("language"))
         self.btn_tools.setText(tr("tools_btn"))
         self.tools_menu.setTitle(tr("tools_menu"))
+        self.view_menu.setTitle(tr("view_menu"))
+        self.appearance_menu.setTitle(tr("appearance_menu"))
+        for mode, act in self.appearance_actions.items():
+            act.setText(tr(f"appearance_{mode}"))
         self.tools_action.setText(tr("tools_btn"))
         self.src_box.setTitle(tr("source_group"))
         self.src_input.setPlaceholderText(tr("drop_hint"))
@@ -289,13 +382,33 @@ class MainWindow(QWidget):
         self.btn_cancel.setText(tr("cancel"))
         for i, mode in enumerate(MODES):
             self.mode_tabs.setTabText(i, tr(f"mode_{mode}"))
-        self.btn_go.setText(tr("extract") if self.is_extract() else tr("compress"))
+        self._update_go_label()
         self.encrypt_panel.retranslate()
         self.extract_panel.retranslate()
+        self._align_label_columns()
         self.tools_dialog.retranslate()
+        # 进度说明按当前语言里较长的一种情形留出宽度，数字变化时进度条不跟着伸缩。
+        sample = PROGRESS_SEP.join([tr("progress_percent", n="100"),
+                                    tr("progress_speed", size=format_size(999_900_000)),
+                                    tr("eta_minutes", m="59", s="50")])
+        self.progress_lbl.setMinimumWidth(self.progress_lbl.fontMetrics().horizontalAdvance(sample))
+        self._refresh_progress()
         self.on_level_changed()
         self.refresh_busy_ui()
         # 换语言后说明文字的行数会变，等布局更新后再按需加高窗口。
+        QTimer.singleShot(0, self.grow_to_fit)
+
+    def _align_label_columns(self) -> None:
+        """两种模式的第二张卡片用同样宽的标签列（格式、级别、密码、输出 / 目标），切换模式时
+        输入框的左边缘对齐。EncryptPanel 已为隐藏的「密码」「加密方式」留了宽度，这里取全部
+        标签中最宽的一个。"""
+        labels = (self.fmt_lbl, self.level_lbl, self.out_lbl, self.encrypt_panel.pw_lbl,
+                  self.encrypt_panel.method_lbl, self.extract_panel.dest_lbl)
+        width = max(lbl.sizeHint().width() for lbl in labels)
+        for box in (self.opt_box, self.extract_panel.ext_box):
+            box.layout().setColumnMinimumWidth(0, width)
+
+    def _schedule_grow(self) -> None:
         QTimer.singleShot(0, self.grow_to_fit)
 
     def grow_to_fit(self) -> None:
@@ -326,14 +439,41 @@ class MainWindow(QWidget):
         for field in ((self.src_input, self.out_input) if extract
                       else (panel.arc_input, panel.dest_input)):
             field.revert()
-        self.src_box.setVisible(not extract)
-        self.opt_box.setVisible(not extract)
-        self.extract_panel.setVisible(extract)
-        self.btn_go.setText(tr("extract") if extract else tr("compress"))
+        # 先隐藏离开的卡片再显示新的：两张同时可见的一瞬间所需的最小高度超过窗口，
+        # Qt 会把窗口拉高，之后不会缩回（用户发现，2026-11-09）。
+        outgoing, incoming = ((self.src_box, self.extract_panel) if extract
+                              else (self.extract_panel, self.src_box))
+        outgoing.hide()
+        incoming.show()
+        self.mode_cards.setCurrentIndex(1 if extract else 0)
+        self._focus_mode_field()
+        self._update_go_label()
         if not self.is_busy():
             # 在另一个模式期间，这个模式的路径可能已在 Finder 里被删除或创建。
             (self.extract_panel if extract else self.src_input).recheck()
         self.refresh_busy_ui()
+
+    def _focus_mode_field(self) -> None:
+        """切换模式后把焦点放在当前模式的路径框（与启动时一致）；用键盘在分段按钮上切换时
+        焦点留在分段按钮上。
+
+        不这样做时，焦点随隐藏的卡片被 Qt 转给别处：叠放控件换页时若新一页没有可用的控件
+        （没有归档时目标框和按钮都停用），焦点会落在卡片本身。路径框停用（任务进行中）时
+        交给窗口本身，不留在任何控件上。
+        """
+        if self.mode_tabs.hasFocus():
+            return
+        field = self.extract_panel.arc_input if self.is_extract() else self.src_input
+        if field.isEnabled():
+            field.setFocus()
+        else:
+            self.setFocus()
+
+    def _update_go_label(self) -> None:
+        """主按钮的文字和图标随模式变化。"""
+        extract = self.is_extract()
+        self.btn_go.setText(tr("extract") if extract else tr("compress"))
+        theme.set_icon(self.btn_go, "unarchive" if extract else "inventory_2")
 
     def on_lang_changed(self) -> None:
         """保存用户选择的语言，并刷新可见标签和 Qt 自带文案的翻译。"""
@@ -379,18 +519,21 @@ class MainWindow(QWidget):
     def on_level_changed(self, *_: object) -> None:
         """根据滑块值刷新仅存储或高内存提示；忽略 Qt 信号的附加参数。"""
         fmt = self.current_format()
+        v = self.level_slider.value()
         if fmt.level is None:
             self.level_val.setText("–")
-            self.level_note.setText(tr("level_none"))
-            return
-        v = self.level_slider.value()
-        self.level_val.setText(str(v))
-        if fmt.key == "tar.zst" and v > 19:
-            self.level_note.setText(tr("ultra_note"))
-        elif v == 0 and fmt.key in ("zip", "7z"):
-            self.level_note.setText(tr("level_store"))
+            note = tr("level_none")
         else:
-            self.level_note.setText("")
+            self.level_val.setText(str(v))
+            if fmt.key == "tar.zst" and v > 19:
+                note = tr("ultra_note")
+            elif v == 0 and fmt.key in ("zip", "7z"):
+                note = tr("level_store")
+            else:
+                note = ""
+        self.level_note.setText(note)
+        # 没有提示时隐藏这一行，否则空行加上网格间距会在滑块下留出一段空白。
+        self.level_note.setVisible(bool(note))
 
     # ---------------- 源 / 输出 ----------------
     def set_source(self, path: str) -> None:
@@ -415,10 +558,24 @@ class MainWindow(QWidget):
         self.update_go_state()
 
     def choose_folder(self) -> None:
-        self.set_source(QFileDialog.getExistingDirectory(self, tr("choose_folder")))
+        self.pick_source("", folder=True)
 
     def choose_file(self) -> None:
-        self.set_source(QFileDialog.getOpenFileName(self, tr("choose_file"))[0])
+        self.pick_source("", folder=False)
+
+    def pick_source(self, start: str, *, folder: bool) -> None:
+        """在原生面板里选择源，start 是面板一开始显示的位置。重新选中被隐私保护拦住的源
+        也走这里：在系统提供的面板里亲自选择，就是 macOS 认可的授权。"""
+        if folder:
+            chosen = QFileDialog.getExistingDirectory(self, tr("choose_folder"), start)
+        else:
+            chosen = QFileDialog.getOpenFileName(self, tr("choose_file"), start)[0]
+        if chosen and core.same_location(chosen, self.src):
+            # 选的还是当前的源（只是为了授权，面板返回的写法可能与键入的不同）：不重新提交，
+            # 否则会把用户设置的输出位置和名称重置成默认值。
+            self.src_input.recheck()
+            return
+        self.set_source(chosen)
 
     def output_path(self) -> Path:
         """由源路径、命名偏好和当前格式组合输出路径；调用前必须已有源。"""
@@ -492,8 +649,16 @@ class MainWindow(QWidget):
         if not self.tools.installing:
             self.tools.refresh()
         if not self.is_busy():
-            # 发出 checked，随后刷新按钮和输出提示。
-            (self.extract_panel if self.is_extract() else self.src_input).recheck()
+            # 发出 checked，随后刷新按钮和输出提示。用户可能刚在系统设置里授予了访问权限，
+            # 或在访达里改了权限，所以输出框也要重新校验。
+            if self.is_extract():
+                self.extract_panel.recheck()
+            else:
+                self.src_input.recheck()
+                # 只重新校验键入后没通过、或还没提交的输出；已提交的有效输出由按钮刷新时的
+                # 预检（_output_problem）重新判断，重校验它会留下错误，之后换格式也不再更新路径。
+                if self.out_input.pending or self.out_input.rejected:
+                    self.out_input.recheck()
 
     def missing_tools(self) -> tuple[str | None, list[str]]:
         """返回当前模式涉及的格式和它缺少的工具；解压模式按已提交归档的实际格式判断。"""
@@ -521,6 +686,9 @@ class MainWindow(QWidget):
         self.banner_btn.setText(button)
         self.warn_lbl.setVisible(bool(text))
         self.banner_btn.setVisible(bool(text))
+        if self.banner.isHidden() == bool(text):
+            self._schedule_grow()  # 横幅出现时窗口要加高
+        self.banner.setVisible(bool(text))
 
     # ---------------- 任务 ----------------
     def is_busy(self) -> bool:
@@ -580,6 +748,7 @@ class MainWindow(QWidget):
         busy = self.is_busy()
         running = self.job is not None
         self.progress.setVisible(running)
+        self.progress_lbl.setVisible(running)
         self.btn_cancel.setEnabled(running)
         for w in (self.mode_tabs, self.src_input, self.btn_folder, self.btn_file,
                   self.fmt_combo, self.extreme_chk):
@@ -617,7 +786,7 @@ class MainWindow(QWidget):
             core.check_compress_output(self.src, out)
         except (core.JobError, OSError) as exc:
             err = exc if isinstance(exc, core.JobError) else core.job_error_from_os(exc)
-            self.show_message(QMessageBox.Warning, tr("failed", err=tr(err.key, **err.kw)))
+            self.report_failure("failed", err)
             return
         if self.encrypt_panel.problem() is not None:
             return  # 原因已显示在加密选项里
@@ -655,8 +824,7 @@ class MainWindow(QWidget):
             core.check_output_dir(dest)
         except (core.JobError, OSError) as exc:
             err = exc if isinstance(exc, core.JobError) else core.job_error_from_os(exc)
-            self.show_message(QMessageBox.Warning,
-                              tr("extract_failed", err=tr(err.key, **err.kw)))
+            self.report_failure("extract_failed", err)
             return
         self._launch(core.ExtractJob(archive, dest, log=self.bridge.log.emit))
 
@@ -664,6 +832,14 @@ class MainWindow(QWidget):
         """在后台线程运行 job，并通知工具链控制器有任务在运行。"""
         self.job = job
         self.t0 = time.monotonic()
+        job.set_progress(self.bridge.progress.emit)
+        # 有焦点的路径框马上会被停用，Qt 会把焦点交给下一个控件（日志），M3 的焦点描边让它
+        # 像被选中了；先把焦点放在窗口本身。
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._last_progress = ("", 0, None, "bytes")
+        self._estimator = ProgressEstimator(self.t0)
+        self._show_progress()
+        self._progress_timer.start()
         # 通知控制器任务开始，工具链窗口随之停用安装按钮，保持两者互斥。
         self.tools.set_job_running(True)
         # 非守护线程：退出流程会先取消任务并等待它结束，保证子进程和暂存目录被清理。
@@ -682,12 +858,43 @@ class MainWindow(QWidget):
         if self.job:
             self.job.cancel()
 
+    def on_progress(self, phase: str, done: int, total: int | None, unit: str) -> None:
+        """任务的进度（经 Bridge 转到主线程）。任务已经结束后才到的进度不再显示。"""
+        if self.job is None:
+            return
+        if phase != self._last_progress[0]:
+            self._estimator = ProgressEstimator(time.monotonic())  # 新阶段重新估算
+        self._last_progress = (phase, done, total, unit)
+        self._show_progress()
+
+    def _refresh_progress(self) -> None:
+        """定时器：进度一段时间没变时也重新估算一次，速度下降、剩余时间随之变长。"""
+        if self.job is not None:
+            self._show_progress()
+
+    def _show_progress(self) -> None:
+        """按最近一次进度更新进度条和说明文字。"""
+        phase, done, total, unit = self._last_progress
+        rate, eta = (self._estimator.update(done, total, time.monotonic())
+                     if phase == "work" else (None, None))
+        if phase == "finish":
+            self.progress.setRange(0, 1)
+            self.progress.setValue(1)
+        elif phase == "work" and total:
+            # QProgressBar 的值是 int；字节数可能超过 2³¹，按千分比显示。
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(min(1000, done * 1000 // total))
+        else:
+            self.progress.setRange(0, 0)  # 不确定进度：统计、准备，或总量未知
+        self.progress_lbl.setText(format_progress(phase, done, total, unit, rate, eta))
+
     def on_job_done(self, path: Path | None, err: Exception | None) -> None:
         """在主线程处理结果；path 为成功产物，err 为失败或取消原因。退出途中只记日志不弹窗。"""
         extract = isinstance(self.job, core.ExtractJob)
         job = self.job
         self.job = None
         self._worker = None
+        self._progress_timer.stop()
         self.tools.set_job_running(False)
         if (isinstance(job, core.ExtractJob) and isinstance(err, core.JobError)
                 and err.key in PASSWORD_ERRORS and not self._quit_requested):
@@ -711,10 +918,10 @@ class MainWindow(QWidget):
         elif isinstance(err, core.Cancelled):
             self.append_log(tr("extract_cancelled" if extract else "cancelled"))
         else:
-            text = tr("extract_failed" if extract else "failed", err=self._error_text(err))
-            self.append_log(text)
+            prefix = "extract_failed" if extract else "failed"
+            self.append_log(tr(prefix, err=self._error_text(err)))
             if not self._quit_requested:
-                self.show_message(QMessageBox.Warning, text)
+                self.report_failure(prefix, err)
         self._maybe_finish_quit()
 
     def _retry_with_password(self, job: core.ExtractJob, err: core.JobError) -> None:
@@ -779,6 +986,113 @@ class MainWindow(QWidget):
         if not started:
             self.append_log(tr("reveal_failed"))
 
+    # ---------------- 访问被拒 ----------------
+    def report_failure(self, prefix_key: str, err: Exception) -> None:
+        """显示开始前预检或任务失败的原因；访问被拒且有补救办法时改用带按钮的对话框。"""
+        text = tr(prefix_key, err=self._error_text(err))
+        if isinstance(err, core.JobError) and err.denial in _DENIAL_ACTIONS:
+            self.show_denied(text, err)
+        else:
+            self.show_message(QMessageBox.Warning, text)
+
+    def show_denied(self, text: str, err: core.JobError) -> None:
+        """访问被拒的对话框。隐私保护：「授予访问权限…」在原生面板里重新选择（知道是哪个路径
+        框时），「打开系统设置」打开文件与文件夹页面；POSIX 权限或锁定：「在访达中显示」，
+        方便用「显示简介」修改。"""
+        path = str(err.kw.get("path") or "")
+        field = self._field_for(path)
+        box = QMessageBox(QMessageBox.Warning, core.APP_NAME, text, parent=self)
+        actions: dict[object, Callable[[], None]] = {}
+        if err.denial == "privacy":
+            help_text = privacy_help()
+            if field is not None:
+                help_text = tr("privacy_grant_hint", button=tr("grant_access")) + "\n\n" + help_text
+            elif self._inside_source(path):
+                # 被拦住的是源里面的子文件夹（开始前的检查逐层列出）：重新选择它会把源换掉，
+                # 所以不提供「授予访问权限…」，改为说明可以换个文件夹或用完全磁盘访问权限。
+                help_text = tr("privacy_inside") + "\n\n" + help_text
+            box.setInformativeText(help_text)
+            if field is not None:
+                actions[box.addButton(tr("grant_access"), QMessageBox.ActionRole)] = \
+                    lambda: self.reselect(field, path)
+            actions[box.addButton(tr("open_privacy_settings"), QMessageBox.ActionRole)] = \
+                self.open_privacy_settings
+        elif path:
+            actions[box.addButton(tr("show_in_finder"), QMessageBox.ActionRole)] = \
+                lambda: self.show_in_finder(_reachable(path))
+        ok = box.addButton(tr("ok"), QMessageBox.AcceptRole)
+        box.setDefaultButton(ok)
+        box.setEscapeButton(ok)  # 有了 ActionRole 按钮，Qt 不再自动把「好」当作 Esc 按钮
+        box.exec()
+        if (action := actions.get(box.clickedButton())) is not None:
+            action()
+
+    def fix_access(self, err: core.JobError, field: str) -> None:
+        """处理路径框旁的补救按钮：隐私保护时重新选择，其他原因在访达中显示。"""
+        path = str(err.kw.get("path") or "")
+        if err.denial == "privacy":
+            self.reselect(field, path)
+        elif path:
+            self.show_in_finder(_reachable(path))
+
+    def reselect(self, field: str, path: str) -> None:
+        """在原生面板里重新选择被拒的项目，面板一开始就显示它。用户在系统提供的面板里亲自
+        选择，macOS 就允许应用访问所选项目；选了别的位置时以新选择为准。"""
+        if self.is_busy():
+            return
+        if field == "source":
+            self.pick_source(path, folder=os.path.isdir(path))
+        elif field == "output":
+            self.pick_output_dir(path)
+        elif field == "archive":
+            self.extract_panel.pick_archive(path)
+        elif field == "dest":
+            self.extract_panel.pick_dest(Path(path) if path else None, regrant=True)
+
+    def pick_output_dir(self, start: str) -> None:
+        """重新选择被拒的输出文件夹：暂存和提交都在文件夹里进行，授权要给文件夹而不是文件，
+        所以用文件夹面板；选中后只换目录，保留输出名称。"""
+        if self.src is None:
+            return
+        if start and not os.path.isdir(start):
+            start = os.path.dirname(start)
+        folder = QFileDialog.getExistingDirectory(self, tr("output"), start)
+        if folder:
+            self.out_dir = Path(folder)
+            self.update_output_path()
+            self.update_go_state()
+
+    def open_privacy_settings(self) -> None:
+        if not open_privacy_settings():
+            self.append_log(tr("privacy_settings_failed"))
+
+    def _field_for(self, path: str) -> str | None:
+        """被拒的路径属于哪个路径框，决定「授予访问权限…」打开哪种面板；对不上时返回 None，
+        对话框只提供打开系统设置。"""
+        if not path:
+            return None
+        p = Path(path)
+
+        def covers(base: Path | None) -> bool:
+            return base is not None and (p == base or base in p.parents)
+
+        if self.is_extract():
+            panel = self.extract_panel
+            if panel.archive is not None and p == panel.archive:
+                return "archive"
+            return "dest" if covers(panel.dest_path()) else None
+        # 只有源本身被拒才重新选择源；源里面的子文件夹被拒时，选中它会把整个源换成那个子文件夹。
+        if self.src is not None and p == self.src:
+            return "source"
+        if self.src is not None and p in (self.output_path(), self.output_path().parent):
+            return "output"
+        return None
+
+    def _inside_source(self, path: str) -> bool:
+        """path 是否在压缩模式的源文件夹里面（不含源本身）。"""
+        return (not self.is_extract() and self.src is not None and bool(path)
+                and self.src in Path(path).parents)
+
     def show_message(self, icon: QMessageBox.Icon, text: str) -> None:
         """显示应用消息，并确保确认按钮跟随应用语言而非系统语言。"""
         box = QMessageBox(icon, core.APP_NAME, text, parent=self)
@@ -834,6 +1148,15 @@ class MainWindow(QWidget):
         self.tools.kill_install()
 
 
+def _reachable(path: str) -> Path:
+    """在访达中显示被拒项目时要显示的位置：path 本身，或者它最近一个看得见的上级。上级文件夹
+    没有执行权限时 path 本身 stat 不到，访达也打不开它；挡住访问的正是那个上级。"""
+    p = Path(path)
+    while not os.path.lexists(p) and p.parent != p:
+        p = p.parent
+    return p
+
+
 def settings_scope(bundle_id: str) -> tuple[str, str]:
     """把 bundle id 拆成 QSettings 的 (组织域名, 应用名)。
 
@@ -862,6 +1185,12 @@ def migrate_legacy_settings(settings: QSettings, legacy: QSettings | None = None
     settings.sync()
 
 
+def appearance_pref(settings: QSettings) -> str:
+    """保存的外观偏好（theme.APPEARANCES 之一）；没有或无法识别时跟随系统。"""
+    value = settings.value("appearance")
+    return value if value in theme.APPEARANCES else theme.APPEARANCES[0]
+
+
 def main() -> None:
     """创建 Qt 应用，加载语言偏好并启动主事件循环。"""
     # 从 Finder 启动时可打开文件数只有 256，解压很深的目录树需要更多（见 core.raise_fd_limit）。
@@ -871,6 +1200,8 @@ def main() -> None:
     app.setApplicationVersion(core.APP_VERSION)
     settings = QSettings(*settings_scope(core.BUNDLE_ID))
     migrate_legacy_settings(settings)
+    # 「显示 ▸ 外观」保存的选择，默认跟随系统；在建窗口之前设置，界面一出现就是这个配色。
+    theme.set_appearance(app, appearance_pref(settings))
     set_lang(settings.value("lang") or detect_lang(QLocale.system().uiLanguages()))
     install_qt_translator()
     w = MainWindow(settings)

@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QGridLayout, QHBoxLayout, Q
                                QWidget)
 
 import core
-from gui_common import NOTE_STYLE, WARN_STYLE
+import theme
 from i18n import tr
 
 
@@ -28,7 +28,8 @@ class EncryptPanel(QObject):
         self._fmt = core.ENCRYPTABLE[0]
         self._busy = False
         self._grid: QGridLayout | None = None  # place 放入的网格
-        self.encrypt_chk = QCheckBox()
+        # 打开、关闭一项设置用 M3 开关；「显示密码」只是临时查看，保留复选框（用户决定）。
+        self.encrypt_chk = theme.Switch()
         self.encrypt_chk.toggled.connect(self._on_changed)
 
         self.pw_lbl = QLabel()
@@ -48,24 +49,27 @@ class EncryptPanel(QObject):
         for method in core.ZIP_METHODS:
             self.method_combo.addItem("", method)
         self.method_combo.currentIndexChanged.connect(self._on_changed)
-        self.names_chk = QCheckBox()
+        self.names_chk = theme.Switch()
         self.names_chk.setChecked(True)
         self.names_chk.toggled.connect(self._on_changed)
         self.hint = QLabel()  # 密码的问题，例如两次输入不一致
-        self.hint.setStyleSheet(WARN_STYLE)
+        theme.set_role(self.hint, "warn")
         self.note = QLabel()  # 当前格式下加密的说明
-        self.note.setStyleSheet(NOTE_STYLE)
+        theme.set_role(self.note, "note")
         for lbl in (self.hint, self.note):
             lbl.setWordWrap(True)
 
     def place(self, grid: QGridLayout, row: int, span: int) -> int:
         """把控件放进 grid：标签在第 0 列，其余从第 1 列起占 span 列；返回下一个空行。"""
         self._grid = grid
+        # 「显示密码」放在两个密码框同一行的末尾：M3 的控件比原生的高，单独占一行会让打开
+        # 加密后的窗口在小屏幕上放不下。
         fields = QHBoxLayout()
-        fields.addWidget(self.pw_input)
-        fields.addWidget(self.pw_confirm)
+        fields.addWidget(self.pw_input, 1)
+        fields.addWidget(self.pw_confirm, 1)
+        fields.addWidget(self.show_chk)
         rows: list[tuple[QLabel | None, QWidget | QHBoxLayout]] = [
-            (None, self.encrypt_chk), (self.pw_lbl, fields), (None, self.show_chk),
+            (None, self.encrypt_chk), (self.pw_lbl, fields),
             (self.method_lbl, self.method_combo), (None, self.names_chk),
             (None, self.hint), (None, self.note)]
         for label, item in rows:

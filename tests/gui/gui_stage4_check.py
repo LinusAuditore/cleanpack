@@ -40,6 +40,8 @@ def wait_until(cond, timeout: float = 20.0) -> bool:
 
 
 app = QApplication([])
+import theme  # noqa: E402
+theme.apply(app)  # 与 main.main() 一样套用 M3 主题，夹具测的才是实际界面
 tmp = Path(tempfile.mkdtemp(prefix="cleanpack-gui4-", dir="/tmp"))
 dialogs: list[str] = []
 main.MainWindow.show_message = lambda self, icon, text: dialogs.append(text)

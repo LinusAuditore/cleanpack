@@ -7,6 +7,7 @@ import errno
 import fnmatch
 import hashlib
 import itertools
+import math
 import os
 import re
 import resource
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unicodedata
 import urllib.parse
 import zlib
@@ -231,18 +233,22 @@ def check_password(password: str, fmt_key: str | None) -> None:
 
 
 class JobError(Exception):
-    """带翻译 key 的错误，GUI 负责本地化。"""
+    """带翻译 key 的错误，GUI 负责本地化。
 
-    def __init__(self, key: str, **kw: object) -> None:
+    denial 是访问被拒的原因（见 classify_denial），界面据此决定提供哪种补救按钮；其他错误
+    为 None。它不放进 kw，kw 只放文案的占位符。
+    """
+
+    def __init__(self, key: str, *, denial: str | None = None, **kw: object) -> None:
         super().__init__(key)
-        self.key, self.kw = key, kw
+        self.key, self.kw, self.denial = key, kw, denial
 
 
 # ---------- 文件系统错误与输出预检 ----------
 # 常见 errno 对应的翻译 key；其余错误统一归为 io_error，附带系统给出的原因。
 _ERRNO_KEYS = {
     errno.ENOSPC: "no_space", errno.EDQUOT: "no_space", errno.EROFS: "read_only",
-    errno.EACCES: "access_denied", errno.EPERM: "access_denied",  # EPERM 也覆盖 TCC 受保护目录
+    errno.EACCES: "access_denied", errno.EPERM: "access_denied",  # 具体原因见 classify_denial
     errno.ENOENT: "not_found", errno.ENOTDIR: "not_found", errno.EISDIR: "out_is_dir",
     errno.ENAMETOOLONG: "name_too_long",
 }
@@ -259,6 +265,61 @@ def _visible_path(name: str) -> str:
     return name
 
 
+# 访问被拒的原因（classify_denial 的返回值）对应的专门文案；posix 沿用调用方给出的 key。
+# system_read 不是 classify_denial 的返回值：读取被 SIP 拒绝时 _denied 改用它，因为
+# system_denied 的文案说的是“不能修改”，而压缩源、读取归档只是读。
+_DENIAL_KEYS = {"privacy": "privacy_denied", "locked": "locked_denied",
+                "system": "system_denied", "system_read": "system_read_denied"}
+# 访达「已锁定」对应 uchg；仅追加（append）同样让修改以 EPERM 失败。
+_LOCK_FLAGS = stat.UF_IMMUTABLE | stat.SF_IMMUTABLE | stat.UF_APPEND | stat.SF_APPEND
+
+
+def classify_denial(path: str | os.PathLike[str], err_no: int | None, *,
+                    write: bool = True) -> str:
+    """判断访问 path 被拒的原因，返回 privacy、locked、system 或 posix。
+
+    err_no 是系统调用给出的 errno；为 None 表示只有 os.access 的结论。write 表示被拒的是
+    修改（新建、写入、改名），读取时为 False。
+
+    EACCES 只来自 POSIX 权限或 ACL。EPERM 的来源更多：macOS 隐私保护（TCC，例如未获授权的
+    桌面、文稿、下载、外置卷）、文件被锁定、系统完整性保护（SIP）都会给出它，所以先看文件
+    标志排除后两种，剩下的按隐私保护处理，文案里也只说“通常”。锁定只阻止修改，不阻止读取，
+    所以只在 write 时考虑。os.access 不反映隐私保护，但 access(2) 会经过 SIP 的检查（例如
+    /private/var/db/oah：权限位允许读取，access 却以 EPERM 失败），而 Python 丢掉了 errno；
+    所以只有 os.access 的结论（err_no 为 None）时，带 restricted 标志的位置按 system 处理，
+    其余按 POSIX 权限或锁定。
+
+    路径存在时只看它自己的标志；不存在时（要在其中新建）看它所在的文件夹。先解析成真实
+    路径：/tmp、/var 这些链接本身带 SIP 的 restricted 标志，指向的 /private/tmp 却是普通文件夹。
+    """
+    real = os.path.realpath(path)
+    try:
+        flags = os.lstat(real).st_flags
+    except OSError:
+        try:
+            flags = os.lstat(os.path.dirname(real)).st_flags
+        except OSError:
+            flags = 0
+    if err_no == errno.EACCES:
+        return "posix"
+    if write and flags & _LOCK_FLAGS:
+        return "locked"
+    if err_no is None and flags & stat.SF_RESTRICTED:
+        return "system"
+    if err_no != errno.EPERM:
+        return "posix"
+    if flags & stat.SF_RESTRICTED:  # 受 SIP 保护的系统位置，ls -lO 显示 restricted
+        return "system"
+    return "privacy"
+
+
+def _denied(key: str, path: Path, err_no: int | None, *, write: bool) -> JobError:
+    """访问 path 被拒时的错误：posix 用调用方的 key，其他原因用对应的专门文案。"""
+    denial = classify_denial(path, err_no, write=write)
+    lookup = "system_read" if denial == "system" and not write else denial
+    return JobError(_DENIAL_KEYS.get(lookup, key), denial=denial, path=str(path))
+
+
 def job_error_from_os(exc: OSError) -> JobError:
     """把 OSError 转成可翻译的 JobError，界面不再直接显示英文系统消息。"""
     key = _ERRNO_KEYS.get(exc.errno or 0, "io_error")
@@ -267,7 +328,13 @@ def job_error_from_os(exc: OSError) -> JobError:
     path = _visible_path(os.fsdecode(name)) if name else ""
     if key in _PATH_KEYS and not path:
         key = "io_error"
-    return JobError(key, path=path, err=exc.strerror or str(exc))
+    denial = None
+    if key == "access_denied":
+        # 按实际出错的路径（可能在暂存目录里）判断原因，文案里显示的仍是用户可见的位置。
+        # 任务里经这里转换的多是写入（暂存、提交）；读取用户文件的地方自己调用 _denied。
+        denial = classify_denial(os.fsdecode(name), exc.errno)
+        key = _DENIAL_KEYS.get(denial, key)
+    return JobError(key, denial=denial, path=path, err=exc.strerror or str(exc))
 
 
 def check_output_dir(path: Path) -> None:
@@ -278,8 +345,8 @@ def check_output_dir(path: Path) -> None:
         raise JobError("out_dir_missing", path=str(path)) from None
     except NotADirectoryError:
         raise JobError("out_dir_not_dir", path=str(path)) from None
-    except PermissionError:
-        raise JobError("access_denied", path=str(path)) from None
+    except PermissionError as exc:
+        raise _denied("access_denied", path, exc.errno, write=True) from None
     if not stat.S_ISDIR(st.st_mode):
         raise JobError("out_dir_not_dir", path=str(path))
     try:
@@ -289,7 +356,19 @@ def check_output_dir(path: Path) -> None:
     if read_only:
         raise JobError("read_only", path=str(path))
     if not os.access(path, os.W_OK | os.X_OK):
-        raise JobError("access_denied", path=str(path))
+        raise _denied("access_denied", path, None, write=True)
+
+
+def same_location(a: Path | str | None, b: Path | str | None) -> bool:
+    """a 和 b 是否指向同一个文件或文件夹（按 inode 比较）。键入的路径可能和原生面板返回的
+    写法不同（APFS 不区分大小写、中间经过符号链接），按字符串比较会把同一位置当成新的选择。
+    任一个不存在或读不了时返回 False。"""
+    if a is None or b is None:
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def is_within(path: Path | str, ancestor: Path | str) -> bool:
@@ -431,8 +510,8 @@ def validate_source(path: Path | str) -> Path:
         st = os.stat(p)  # 悬空链接按不存在处理
     except (FileNotFoundError, NotADirectoryError):
         raise JobError("src_missing", path=str(p)) from None
-    except PermissionError:
-        raise JobError("src_denied", path=str(p)) from None
+    except PermissionError as exc:
+        raise _denied("src_denied", p, exc.errno, write=False) from None
     except OSError as exc:
         raise job_error_from_os(exc) from exc
     # 顶层名称本身匹配排除规则时，工具会把整个源排除掉，得到一个“成功”的空归档。
@@ -442,8 +521,61 @@ def validate_source(path: Path | str) -> Path:
     if not (is_dir or stat.S_ISREG(st.st_mode)):
         raise JobError("src_unsupported_type", path=str(p))  # FIFO、设备文件、套接字
     if not os.access(p, os.R_OK | (os.X_OK if is_dir else 0)):
-        raise JobError("src_denied", path=str(p))
+        raise _denied("src_denied", p, None, write=False)
     return p
+
+
+def check_source_readable(path: Path, check: Callable[[], None] | None = None, *,
+                          name: str | None = None, sizes: bool = False) -> SourceStats:
+    """实际读一次源：文件打开一次，文件夹则逐层列出每个子文件夹（不跟随链接，跳过垃圾项）；
+    读不了时抛出带原因的 JobError。check 对每个文件夹调用一次，用于响应取消。
+
+    同时统计工具要读的内容（进度条的总量），返回 SourceStats。name 是工具输出里源本身的
+    名称（默认 path.name）；sizes 为真时还记下每一项的大小（按文件计进度时用）。
+
+    os.access 和 stat 都看不出 macOS 隐私保护：它只拦读取内容，不拦元数据。Info-ZIP（zip 是
+    默认格式）遇到读不了的子文件夹会静默跳过、照常成功，归档里悄悄少了内容（例如压缩个人
+    文件夹时未获授权的“桌面”）；bsdtar 和 7-Zip 会以非 0 退出，但只能报“工具失败”。所以开始前
+    先完整检查一遍，给出带原因、能补救的错误。首次读取受保护的位置时系统可能弹出同意框并
+    阻塞当前线程，所以只在任务的工作线程里调用，不在界面线程的键入校验里调用。
+
+    能列出但不能进入（有 r 没有 x）的文件夹也要拦下：列出不需要 x，Info-ZIP 却打不开其中的
+    文件，同样静默跳过。路径超过 PATH_MAX 等与权限无关的错误不在这里报告：这一步按完整路径
+    遍历，而 bsdtar 按相对路径遍历，能处理更深的树，交给工具自己判断。
+    """
+    def skip_unless_denied(exc: OSError) -> None:
+        if isinstance(exc, PermissionError):
+            raise exc
+
+    top = name or path.name
+    stats = SourceStats(sizes={} if sizes else None)
+    try:
+        if not path.is_dir():
+            with open(path, "rb") as f:
+                stats.add(top, os.fstat(f.fileno()).st_size)
+            return stats
+        for dirpath, dirnames, filenames in os.walk(path, topdown=True,
+                                                    onerror=skip_unless_denied, followlinks=False):
+            if check is not None:
+                check()
+            if not os.access(dirpath, os.X_OK):
+                raise _denied("src_denied", Path(dirpath), None, write=False)
+            dirnames[:] = [d for d in dirnames if not is_junk_name(d)]
+            rel = os.path.relpath(dirpath, path)
+            base = top if rel == "." else f"{top}/{rel}"
+            stats.add(base, 0)
+            for f in filenames:
+                if is_junk_name(f):
+                    continue
+                try:
+                    st = os.lstat(os.path.join(dirpath, f))
+                except OSError:
+                    continue  # 刚被删除或路径过长：只影响进度的估计，交给工具处理
+                stats.add(f"{base}/{f}", st.st_size if stat.S_ISREG(st.st_mode) else 0)
+    except PermissionError as exc:
+        where = Path(os.fsdecode(exc.filename)) if exc.filename else path
+        raise _denied("src_denied", where, exc.errno, write=False) from None
+    return stats
 
 
 def parse_output(raw: str, out_dir: Path) -> tuple[Path, str | None] | None:
@@ -704,8 +836,8 @@ def validate_archive(path: Path | str) -> Path:
         st = os.stat(p)
     except (FileNotFoundError, NotADirectoryError):
         raise JobError("src_missing", path=str(p)) from None
-    except PermissionError:
-        raise JobError("src_denied", path=str(p)) from None
+    except PermissionError as exc:
+        raise _denied("src_denied", p, exc.errno, write=False) from None
     except OSError as exc:
         raise job_error_from_os(exc) from exc
     if not stat.S_ISREG(st.st_mode):
@@ -713,7 +845,7 @@ def validate_archive(path: Path | str) -> Path:
     if detect_format(p.name) is None:
         raise JobError("archive_unsupported", name=p.name)
     if not os.access(p, os.R_OK):
-        raise JobError("src_denied", path=str(p))
+        raise _denied("src_denied", p, None, write=False)
     return p
 
 
@@ -977,14 +1109,15 @@ _U16_MAX, _U32_MAX = 0xFFFF, 0xFFFFFFFF
 @dataclass(frozen=True)
 class _ZipEntry:
     """中央目录中的一项：中央头与本地头的绝对偏移、原始文件名字节、通用标志位，
-    外部属性高 16 位里的 Unix 文件类型和权限（不是 Unix 生成的归档通常为 0），以及压缩方法
-    （AES 成员取扩展字段里记录的真实方法）。"""
+    外部属性高 16 位里的 Unix 文件类型和权限（不是 Unix 生成的归档通常为 0）、压缩方法
+    （AES 成员取扩展字段里记录的真实方法），以及解压后的大小（估算解压进度用）。"""
     central: int
     local: int
     name: bytes
     flags: int = 0
     mode: int = 0
     method: int = 0
+    usize: int = 0
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -1027,6 +1160,20 @@ def _zip64_local_offset(extra: bytes, csize: int, usize: int, offset: int) -> in
             return struct.unpack_from("<Q", body, skip)[0]
         i += 4 + length
     raise JobError("zip_invalid")
+
+
+def _zip64_usize(extra: bytes, usize: int) -> int:
+    """返回解压后的大小；32 位字段溢出时从 ZIP64 扩展字段的第一项读取。只用于估算进度，
+    读不到时返回 0，不判为损坏（损坏与否由解压工具和中央目录的其他检查决定）。"""
+    if usize != _U32_MAX:
+        return usize
+    i = 0
+    while i + 4 <= len(extra):
+        tag, length = struct.unpack_from("<HH", extra, i)
+        if tag == 0x0001 and length >= 8:
+            return struct.unpack_from("<Q", extra, i + 4)[0]
+        i += 4 + length
+    return 0
 
 
 def _read_zip64_end(stream: BinaryIO, eocd_at: int) -> tuple[int, tuple[int, ...]] | None:
@@ -1093,7 +1240,8 @@ def _read_central_directory(stream: BinaryIO) -> list[_ZipEntry]:
             real = _aes_field(extra, 9, "<H")
             # 不能写成 “or method”：真实方法 0（存储）是合法值，会被当成没读到。
             method = real if real is not None else method
-        entries.append(_ZipEntry(cd_start + i, local, name, h[3], h[15] >> 16, method))
+        entries.append(_ZipEntry(cd_start + i, local, name, h[3], h[15] >> 16, method,
+                                 _zip64_usize(extra, h[9])))
         i = end
     if len(entries) != n_total:
         raise JobError("zip_invalid")
@@ -1101,9 +1249,21 @@ def _read_central_directory(stream: BinaryIO) -> list[_ZipEntry]:
 
 
 _LOG_LINE_MAX = 2000  # 单行日志的最大字符数
+# 工具报告读取被拒（EPERM）的行，按工具分开：bsdtar「tar: Can't open `x': Operation not
+# permitted」、Info-ZIP「zip warning: Operation not permitted」、7-Zip「WARNING: errno=1 :
+# Operation not permitted」及其汇总行「x : errno=1 : …」。只用产生这一行的工具自己的格式：
+# Info-ZIP 列出成员时整行以成员名结尾（「  adding: 名称」），名称恰好以 7-Zip 的汇总格式
+# 结尾时，共用一个模式就会误判。
+_EPERM_TEXT = re.escape(os.strerror(errno.EPERM))
+_EPERM_LINES = {
+    "tar": re.compile(r"^tar: .*: " + _EPERM_TEXT + "$"),
+    "zip": re.compile(r"^zip warning: " + _EPERM_TEXT + "$"),
+    "7z": re.compile(r"^(?:WARNING: |.* : )errno=1 : " + _EPERM_TEXT + "$"),
+}
 # 工具向标准输入要密码时打印的提示。bsdtar 的提示不换行，会粘在下一条消息前面；
 # 去掉后报错消息才能按原格式识别，日志也不会被重复的提示刷屏。
 _PROMPTS = re.compile(r"^(?:(?:Enter passphrase|Enter password):\s?)+")
+_PROMPT_TAIL = re.compile(r"(?:Enter passphrase:)+$")  # bsdtar -v 时粘在名称后面的提示
 _PROMPT_BYTES = b"Enter passphrase:"  # bsdtar 每次向标准输入要密码时打印一次
 # 行首连续的提示。bsdtar 的错误行以成员名开头，名字中间的提示文字不计数。
 _LEADING_PROMPTS = re.compile(rb"^(?:Enter passphrase:)+")
@@ -1161,6 +1321,137 @@ def _remove_tree(path: Path) -> None:
             subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, env=ENV)
 
 
+# ---------- 进度与剩余时间 ----------
+PROGRESS_INTERVAL = 0.1  # 进度回调的最短间隔（秒），避免每个数据块都刷新界面
+_RELAY_CHUNK = 1 << 20   # 中转和喂数据时每次读写的字节数
+_ZIP_DOT = 1 << 20       # Info-ZIP「-ds 1m」每个点代表的输入字节数
+# 7-Zip「-bsp1」的进度：百分比后面跟着要用退格擦掉的内容（不是终端时照样输出退格符）。
+# 要求后面紧跟退格，才不会把成员名里的「50%」当成进度（成员名那一行以换行结束）。
+_SEVENZIP_PERCENT = re.compile(rb"(\d{1,3})%[^\n\x08]*\x08")
+
+
+class _Progress:
+    """任务进度：线程安全、节流、单调不减。
+
+    phase 为 scan（统计源文件）、prepare（解压前的检查）、work（工具运行中）、finish（整理
+    和提交）；只有 work 有总量。unit 为 bytes、items（按项数）或 percent（7-Zip 只给百分比）。
+    callback(phase, done, total, unit) 在工作线程或读取线程调用，total 为 None 表示不确定。
+    """
+    def __init__(self, callback: Callable[[str, int, int | None, str], None] | None) -> None:
+        self._cb = callback
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self.phase = ""
+        self.done = 0
+        self.total: int | None = None
+        self.unit = "bytes"
+
+    def start(self, phase: str, total: int | None = None, unit: str = "bytes") -> None:
+        """进入新阶段，立即通知（不节流）。"""
+        with self._lock:
+            self.phase, self.total, self.unit, self.done = phase, total, unit, 0
+            self._emit(force=True)
+
+    def update(self, done: int) -> None:
+        """当前阶段已完成 done；比之前少的值忽略，超过总量的按总量算。"""
+        with self._lock:
+            if self.total is not None:
+                done = min(done, self.total)
+            if done > self.done:
+                self.done = done
+                self._emit(force=False)
+
+    def complete(self) -> None:
+        """当前阶段做完了：进度补满并立即通知（预估的总量可能偏大）。"""
+        with self._lock:
+            if self.total is not None:
+                self.done = self.total
+            self._emit(force=True)
+
+    def _emit(self, force: bool) -> None:
+        if self._cb is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last < PROGRESS_INTERVAL:
+            return
+        self._last = now
+        self._cb(self.phase, self.done, self.total, self.unit)
+
+
+class ProgressEstimator:
+    """根据进度估算速度和剩余时间；界面在主线程使用，不依赖 Qt，便于测试。
+
+    速度取指数滑动平均（时间常数 TAU 秒），抹平工具输出的忽快忽慢；开始 WARMUP 秒内或完成
+    不足 1% 时还估不准，不给剩余时间。进度一段时间没变时，界面定时用同样的值再调用一次，
+    速度随之下降、剩余时间变长，不会停在一个过时的估计上。
+    """
+    TAU = 3.0
+    WARMUP = 2.0
+    FIRST_SAMPLE = 0.5
+
+    def __init__(self, now: float) -> None:
+        self._start = now
+        self._t: float | None = None
+        self._done = 0
+        self.rate: float | None = None  # 每秒完成的单位数
+
+    def update(self, done: int, total: int | None, now: float) -> tuple[float | None, float | None]:
+        """记录 now 时刻完成了 done，返回 (速度, 剩余秒数)；还估不出时为 None。"""
+        if self._t is None or done < self._done:
+            self._t, self._done = now, done  # 第一次，或进入了新阶段
+            return self.rate, None
+        dt = now - self._t
+        if self.rate is None and dt < self.FIRST_SAMPLE:
+            # 第一份速度至少用这么长时间的数据：几毫秒内的跳变会算出离谱的速度。
+            return None, None
+        if dt > 0:
+            instant = (done - self._done) / dt
+            alpha = 1 - math.exp(-dt / self.TAU)
+            self.rate = instant if self.rate is None else self.rate + alpha * (instant - self.rate)
+            self._t, self._done = now, done
+        if (total is None or not self.rate or now - self._start < self.WARMUP
+                or done < total * 0.01):
+            return self.rate, None
+        return self.rate, max(0.0, (total - done) / self.rate)
+
+
+def eta_parts(seconds: float) -> tuple[int, int, int]:
+    """把剩余秒数取整成 (时, 分, 秒) 以减少跳动：一分钟内按 5 秒向上取整，一小时内按
+    10 秒，更长时按分钟。"""
+    s = max(0.0, seconds)
+    if s < 60:
+        s = max(5, math.ceil(s / 5) * 5)
+    elif s < 3600:
+        s = round(s / 10) * 10
+    else:
+        s = round(s / 60) * 60
+    s = int(s)
+    return s // 3600, s % 3600 // 60, s % 60
+
+
+def _strip_backspaces(line: str) -> str:
+    """去掉 7-Zip 用退格覆盖的进度：保留最后一个退格之后的内容。"""
+    return line[line.rfind("\x08") + 1:].lstrip() if "\x08" in line else line
+
+
+@dataclass
+class SourceStats:
+    """开始压缩前统计的源：普通文件的总字节数、项数（文件、文件夹、链接；tar 每项一个
+    512 字节的头）、按 tar 格式估算的流大小，以及可选的「名称 → 大小」表（名称是工具在
+    输出里使用的相对路径，以源本身的名称开头；文件夹为 0）。"""
+    total: int = 0
+    entries: int = 0
+    tar_size: int = 1024  # tar 以两个 512 字节的空块结束
+    sizes: dict[str, int] | None = None
+
+    def add(self, name: str, size: int) -> None:
+        self.total += size
+        self.entries += 1
+        self.tar_size += 512 + -(-size // 512) * 512
+        if self.sizes is not None:
+            self.sizes[name] = size
+
+
 class Job:
     """一次性后台任务的公共部分：进程登记与取消、日志排空、暂存目录和错误转换。
 
@@ -1172,15 +1463,29 @@ class Job:
     # 工具进程不会随终端会话一起收到信号（正常退出和取消仍会结束它们）。
     _new_session = False
 
-    def __init__(self, log: Callable[[str], None] = print) -> None:
-        """log 接收命令行和工具输出，每次一行。"""
+    def __init__(self, log: Callable[[str], None] = print,
+                 progress: Callable[[str, int, int | None, str], None] | None = None) -> None:
+        """log 接收命令行和工具输出，每次一行；progress 接收进度，含义见 _Progress。"""
         self.log = log
+        self._progress = _Progress(progress)
+        # 按 bsdtar -v 的输出计进度（见 _track_verbose）：「名称 → 大小」、行首的「a 」或「x 」、
+        # 已处理完的大小，以及名称已打印、还没处理完的那一项。
+        self._verbose: dict[str, int] | None = None
+        self._verbose_prefix = ""
+        self._verbose_done = 0
+        self._current: str | None = None
+        self._relay_error: OSError | None = None  # 中转或喂数据的线程遇到的文件系统错误
         self._cancel = threading.Event()
         self._procs: list[subprocess.Popen] = []
         self._procs_lock = threading.Lock()
         self._pumps: list[threading.Thread] = []
+        self._eperm_tools: set[str] = set()  # 报告过读取被拒（EPERM）的工具，见 _tool_failure
 
     # ---------- 公共接口 ----------
+    def set_progress(self, callback: Callable[[str, int, int | None, str], None] | None) -> None:
+        """在 run 之前设置进度回调（界面在启动任务时统一接上）。"""
+        self._progress = _Progress(callback)
+
     def cancel(self) -> None:
         """设置取消标记并终止已登记进程；清理和等待由 run 所在线程完成。"""
         self._cancel.set()
@@ -1278,15 +1583,26 @@ class Job:
             _send_password(p, password)
         return p
 
-    def _pump(self, stream: BinaryIO) -> threading.Thread:
+    # 工具报告读取被拒时是否按隐私保护报告失败（见 _tool_failure）；只有读用户文件的压缩需要。
+    _report_privacy = False
+
+    def _pump(self, stream: BinaryIO, tool: str | None = None,
+              on_chunk: Callable[[bytes], None] | None = None,
+              log_lines: bool = True) -> threading.Thread:
         """异步排空二进制日志流，避免管道写满阻塞子进程；返回读取线程。
 
         按块而不是按行读取：bsdtar 的密码提示不换行，按行读要等到报错那一行才看得到。
-        每出现新的提示就调用 _on_prompts，子类据此及早发现密码被拒。
+        每出现新的提示就调用 _on_prompts，子类据此及早发现密码被拒。on_chunk 收到每个原始
+        数据块（7-Zip 的百分比、Info-ZIP 的进度点都不换行）；log_lines 为假时只调用 on_chunk，
+        不记日志（Info-ZIP 的进度点单独走 stdout）。
         """
         def run() -> None:
             pending, seen = b"", 0  # 未成行的数据，以及其开头已经报告过的提示数
             while chunk := stream.read1(65536):
+                if on_chunk is not None:
+                    on_chunk(chunk)
+                if not log_lines:
+                    continue
                 pending += chunk
                 *lines, pending = pending.split(b"\n")
                 # 提示总在行首（前一条消息以换行结束），连续的提示连在一起；只数行首那一串，
@@ -1302,83 +1618,241 @@ class Job:
                 if new > 0:
                     self._on_prompts(new)
                 for raw in lines:
-                    self._emit_line(raw)
+                    self._emit_line(raw, tool)
+                if self._verbose is not None:
+                    self._note_pending(pending)
             if pending:
-                self._emit_line(pending)
+                self._emit_line(pending, tool)
             stream.close()
         t = threading.Thread(target=run, daemon=True)
         self._pumps.append(t)
         t.start()
         return t
 
-    def _emit_line(self, raw: bytes) -> None:
-        """记录工具输出的一行：先去掉密码提示再截断，bsdtar 的提示会粘在报错前面。"""
-        line = _PROMPTS.sub("", raw.decode("utf-8", "replace").rstrip())
+    def _emit_line(self, raw: bytes, tool: str | None = None) -> None:
+        """记录 tool 输出的一行：先去掉 7-Zip 用退格覆盖的进度和密码提示再截断，bsdtar 的
+        提示会粘在报错前面。按 -v 计进度时，列出的已知项只计进度、不记日志。"""
+        line = _PROMPTS.sub("", _strip_backspaces(raw.decode("utf-8", "replace").rstrip()))
+        if self._verbose is not None and self._consume_verbose(line):
+            return
+        pattern = _EPERM_LINES.get(tool) if tool is not None and self._report_privacy else None
+        if pattern is not None and pattern.match(line):
+            self._eperm_tools.add(tool)
         if len(line) > _LOG_LINE_MAX:
             # 例如工具反复输出同一行时，一行可达上百 KB，会拖慢日志控件。
             line = line[:_LOG_LINE_MAX] + "…"
         if line:
             self.log(line)
 
+    def _track_verbose(self, prefix: str, sizes: dict[str, int], total: int | None,
+                       unit: str = "bytes") -> None:
+        """按 bsdtar -v 的输出计进度：它在开始处理一项时打印「a 名称」（创建）或「x 名称」
+        （解压），处理完才换行。sizes 是已知的「名称 → 大小」（按项数计时每项为 1）。
+        只认得 sizes 里的名称：恰好以「x 」开头的报错行照常记日志、照常识别。"""
+        self._verbose, self._verbose_prefix = sizes, prefix
+        self._verbose_done, self._current = 0, None
+        self._progress.start("work", total, unit)
+
+    def _verbose_name(self, line: str) -> str | None:
+        if not line.startswith(self._verbose_prefix):
+            return None
+        # 加密 zip 创建时，bsdtar 的密码提示会粘在第一个名称后面。
+        name = _PROMPT_TAIL.sub("", line[len(self._verbose_prefix):])
+        return name if self._verbose is not None and name in self._verbose else None
+
+    def _consume_verbose(self, line: str) -> bool:
+        """完整的一行：这一项处理完了。返回是否是 -v 的列表行（不再记日志）。"""
+        name = self._verbose_name(line)
+        if name is None:
+            return False
+        self._verbose_done += self._verbose[name]
+        self._current = None
+        self._progress.update(self._verbose_done)
+        return True
+
+    def _percent_watcher(self, to_done: Callable[[int], int]) -> Callable[[bytes], None]:
+        """返回一个数据块回调：解析 7-Zip「-bsp1」的百分比，经 to_done 换算后更新进度。
+        一个百分比可能被切在两个数据块之间，所以带上前一块的结尾一起找（重复的值不影响，
+        进度只增不减）。"""
+        tail = [b""]
+
+        def on_chunk(chunk: bytes) -> None:
+            data = tail[0] + chunk
+            if found := _SEVENZIP_PERCENT.findall(data):
+                self._progress.update(to_done(min(100, int(found[-1]))))
+            tail[0] = data[-64:]
+        return on_chunk
+
+    def _note_pending(self, pending: bytes) -> None:
+        """还没换行的数据：名称已打印、正在处理的那一项（解压时据此轮询已写的大小）。"""
+        self._current = self._verbose_name(pending.decode("utf-8", "replace"))
+
     def _on_prompts(self, count: int) -> None:
         """工具又打印了 count 次 bsdtar 的密码提示；在读取线程调用，默认不处理。"""
 
     def _run_simple(self, cmd: list[str], *, tool: str, cwd: Path,
-                    stdout: BinaryIO | int | None = None, password: str | None = None) -> None:
+                    stdout: BinaryIO | int | None = None, password: str | None = None,
+                    on_chunk: Callable[[bytes], None] | None = None,
+                    on_stdout: Callable[[bytes], None] | None = None,
+                    feed: Path | None = None,
+                    meter: Callable[[int], None] | None = None) -> None:
         """运行单个命令并排空日志，任何非 0 退出码都按失败处理。
 
-        stdout 为 None 时合并 stdout/stderr 写入日志；否则把 stdout 写入该文件，只记录 stderr。
+        stdout 为 None 时合并 stdout/stderr 写入日志，on_chunk 另外收到其中的原始数据块；
+        否则把 stdout 写入该文件，只记录 stderr，meter 不为 None 时经中转线程写入并计数。
+        on_stdout 不为 None 时 stdout 单独读、只交给它（Info-ZIP 的进度点），stderr 记日志。
+        feed 不为 None 时从这个文件喂工具的标准输入，meter 收到已喂的字节数。
         password 的含义见 _spawn。
         """
-        if stdout is None:
+        stdin = {"stdin": subprocess.PIPE} if feed is not None else {}
+        threads = []
+        if on_stdout is not None:
+            p = self._spawn(cmd, tool=tool, password=password, cwd=cwd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, **stdin)
+            threads += [self._pump(p.stdout, tool, on_stdout, log_lines=False),
+                        self._pump(p.stderr, tool)]
+        elif stdout is None:
             p = self._spawn(cmd, tool=tool, password=password, cwd=cwd,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            t = self._pump(p.stdout)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **stdin)
+            threads.append(self._pump(p.stdout, tool, on_chunk))
+        elif meter is not None and feed is None:
+            p = self._spawn(cmd, tool=tool, password=password, cwd=cwd,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            threads += [self._relay(p.stdout, stdout, meter, close_dst=False),
+                        self._pump(p.stderr, tool)]
         else:
             p = self._spawn(cmd, tool=tool, password=password, cwd=cwd, stdout=stdout,
-                            stderr=subprocess.PIPE)
-            t = self._pump(p.stderr)
+                            stderr=subprocess.PIPE, **stdin)
+            threads.append(self._pump(p.stderr, tool))
+        if feed is not None:
+            threads.append(self._feed(p, feed, meter))
         rc = p.wait()
-        t.join()
+        for t in threads:
+            t.join()
         self._check_cancel()
+        self._raise_relay_error()
         # 警告类退出码（如 7z 的 1）也可能意味着遗漏文件，不能当作成功。
         if rc:
-            raise JobError("tool_failed", tool=tool, code=rc)
+            raise self._tool_failure(tool, rc)
 
     def _run_pipeline(self, first: list[str], second: list[str], *, tools: tuple[str, str],
-                      cwd: Path, stdout: BinaryIO | int, blame_downstream: bool) -> None:
+                      cwd: Path, stdout: BinaryIO | int, blame_downstream: bool,
+                      meter: Callable[[int], None] | None = None,
+                      feed: Path | None = None) -> None:
         """运行 first | second，second 的输出写入 stdout；检查两端退出码。
 
-        两端都失败时，blame_downstream 决定报告哪一端，含义见 _blame。
+        两端都失败时，blame_downstream 决定报告哪一端，含义见 _blame。meter 不为 None 时
+        两端之间经中转线程连接，meter 收到经过的字节数（压缩时 tar 输出的未压缩字节）；
+        feed 不为 None 时从这个文件喂 first 的标准输入，meter 收到已喂的字节数（解压）。
         """
+        relay = meter is not None and feed is None
         p1 = self._spawn(first, tool=tools[0], cwd=cwd, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE,
+                         **({"stdin": subprocess.PIPE} if feed is not None else {}))
+        threads = [self._pump(p1.stderr, tools[0])]
+        if feed is not None:
+            threads.append(self._feed(p1, feed, meter))
+        p2 = self._spawn(second, tool=tools[1], cwd=cwd,
+                         stdin=subprocess.PIPE if relay else p1.stdout, stdout=stdout,
                          stderr=subprocess.PIPE)
-        threads = [self._pump(p1.stderr)]
-        p2 = self._spawn(second, tool=tools[1], cwd=cwd, stdin=p1.stdout, stdout=stdout,
-                         stderr=subprocess.PIPE)
-        # 父进程不持有读取端，下游退出时上游才能收到管道关闭信号。
-        p1.stdout.close()
-        threads.append(self._pump(p2.stderr))
+        if relay:
+            threads.append(self._relay(p1.stdout, p2.stdin, meter, close_dst=True))
+        else:
+            # 父进程不持有读取端，下游退出时上游才能收到管道关闭信号。
+            p1.stdout.close()
+        threads.append(self._pump(p2.stderr, tools[1]))
         results = [(tools[0], p1.wait()), (tools[1], p2.wait())]
         for t in threads:
             t.join()
         self._check_cancel()
         if (failed := _blame(results, blame_downstream)):
-            raise JobError("tool_failed", tool=failed[0], code=failed[1])
+            raise self._tool_failure(*failed)
+        self._raise_relay_error()
+
+    def _relay(self, src: BinaryIO, dst: BinaryIO, meter: Callable[[int], None], *,
+               close_dst: bool) -> threading.Thread:
+        """把 src（上游的 stdout）原样转给 dst（下游的 stdin 或输出文件），每块之后用累计字节
+        数调用 meter。下游已退出（EPIPE）时停止并关闭读取端：上游再写管道就会因 SIGPIPE
+        结束，与两端直接相连时一样，_blame 的归因不变。写文件失败（例如磁盘已满）记下，由
+        调用方在进程结束后抛出。close_dst 为真时（下游进程的 stdin）结束后关闭它，下游读到 EOF。"""
+        def run() -> None:
+            count = 0
+            try:
+                while data := os.read(src.fileno(), _RELAY_CHUNK):
+                    dst.write(data)
+                    count += len(data)
+                    meter(count)
+                dst.flush()
+            except (BrokenPipeError, ValueError):
+                pass  # 下游已退出或被取消；原因由退出码报告
+            except OSError as exc:
+                self._relay_error = exc
+            finally:
+                src.close()
+                if close_dst:
+                    with contextlib.suppress(OSError, ValueError):
+                        dst.close()
+        t = threading.Thread(target=run, daemon=True)
+        self._pumps.append(t)
+        t.start()
+        return t
+
+    def _feed(self, proc: subprocess.Popen, path: Path,
+              meter: Callable[[int], None] | None) -> threading.Thread:
+        """把 path 的内容喂给 proc 的标准输入，每块之后用累计字节数调用 meter。工具提前退出
+        （tar 读到结束标记、出错或被取消）时停止；读归档本身出错时记下，由调用方抛出。"""
+        def run() -> None:
+            count = 0
+            try:
+                with open(path, "rb") as f:
+                    while data := f.read(_RELAY_CHUNK):
+                        proc.stdin.write(data)
+                        count += len(data)
+                        if meter is not None:
+                            meter(count)
+            except (BrokenPipeError, ValueError):
+                pass
+            except OSError as exc:
+                self._relay_error = exc
+            finally:
+                with contextlib.suppress(OSError, ValueError):
+                    proc.stdin.close()
+        t = threading.Thread(target=run, daemon=True)
+        self._pumps.append(t)
+        t.start()
+        return t
+
+    def _raise_relay_error(self) -> None:
+        """中转或喂数据的线程遇到的文件系统错误（磁盘已满等）比工具的退出码更能说明原因。"""
+        if (exc := self._relay_error) is not None:
+            self._relay_error = None
+            raise exc
+
+    def _tool_failure(self, tool: str, code: int) -> JobError:
+        """工具以 code 失败时的错误。压缩时，失败的正是报告过读取被拒（EPERM）的那个工具，
+        多半是 macOS 隐私保护拦住了源里的某些文件（开始前的检查只看得到文件夹），改用能引导
+        用户授权的文案；被拒的项目已在日志里。别的工具失败（例如压缩器写满磁盘）照实报告。"""
+        if tool in self._eperm_tools:
+            return JobError("privacy_partial", denial="privacy", tool=tool)
+        return JobError("tool_failed", tool=tool, code=code)
 
 
 class ArchiveJob(Job):
     """一次性归档任务；run 在工作线程执行，cancel 可由主线程调用。"""
+    _report_privacy = True  # 读的是用户的文件，工具读取被拒多半是隐私保护
     def __init__(self, src: Path | str, out: Path | str, fmt: str, level: int | None = None,
                  extreme: bool = False, log: Callable[[str], None] = print, *,
                  password: str | None = None, zip_method: str = ZIP_METHODS[0],
-                 encrypt_names: bool = True) -> None:
-        """src/out 为输入输出路径；fmt 选择格式，level/extreme 控制压缩，log 接收日志。
+                 encrypt_names: bool = True,
+                 progress: Callable[[str, int, int | None, str], None] | None = None) -> None:
+        """src/out 为输入输出路径；fmt 选择格式，level/extreme 控制压缩，log 接收日志，
+        progress 接收进度（见 _Progress）。
 
         password 不为 None 时加密（只支持 ENCRYPTABLE 中的格式）：zip_method 是 ZIP_METHODS
         之一，encrypt_names 决定 7z 是否连文件名一起加密（zip 的文件名总是可见）。
         """
-        super().__init__(log)
+        super().__init__(log, progress)
+        self._stats = SourceStats()
         self.src = Path(src).absolute()
         self.out = Path(out).absolute()
         self.fmt = FORMATS[fmt]
@@ -1403,6 +1877,11 @@ class ArchiveJob(Job):
         # 源可能在选择之后被删除或替换；源是链接时改用解析后的目标。
         self.src = validate_source(self.src)
         check_compress_output(self.src, self.out)
+        self._progress.start("scan")
+        # 加密 zip 只能按文件计进度，要记下每一项的大小。
+        per_file = self.fmt.key == "zip" and self.password is not None
+        self._stats = check_source_readable(self.src, self._check_cancel, name=self._name,
+                                            sizes=per_file)
 
         # 每个任务独占暂存目录，避免删除已有 .part 文件或与另一个任务互相覆盖。
         with self._staging(self.out.parent) as staging:
@@ -1414,6 +1893,10 @@ class ArchiveJob(Job):
             else:
                 self._run_7z(tmp)
             self._check_cancel()
+            self._progress.complete()
+            self._progress.start("finish")
+            if self.fmt.key == "zip" and self.password is None and sys.platform == "darwin":
+                self._mark_zip_utf8(tmp)
             os.replace(tmp, self.out)
             return self.out
 
@@ -1452,17 +1935,27 @@ class ArchiveJob(Job):
         return None
 
     def _run_tar(self, tmp: Path) -> None:
-        """把 tar 输出写入 tmp，或经压缩器管道写入；任一端失败都报告对应工具。"""
+        """把 tar 输出写入 tmp，或经压缩器管道写入；任一端失败都报告对应工具。
+
+        tar 的输出经中转线程计数：进度是已打包的未压缩字节，总量按 tar 格式从源的统计估算
+        （每项一个 512 字节的头，内容补齐到 512 字节）。"""
         comp = self._compressor()
+        self._progress.start("work", self._stats.tar_size)
+        meter = self._progress.update
         with open(tmp, "wb") as f:
             if comp:
                 self._run_pipeline(self._tar_cmd(), comp, tools=("tar", self.fmt.tools[-1]),
-                                   cwd=self.src.parent, stdout=f, blame_downstream=True)
+                                   cwd=self.src.parent, stdout=f, blame_downstream=True,
+                                   meter=meter)
             else:
-                self._run_simple(self._tar_cmd(), tool="tar", cwd=self.src.parent, stdout=f)
+                self._run_simple(self._tar_cmd(), tool="tar", cwd=self.src.parent, stdout=f,
+                                 meter=meter)
 
     def _run_zip(self, tmp: Path) -> None:
-        """生成 zip 递归排除参数并写入 tmp，保留符号链接本身。"""
+        """生成 zip 递归排除参数并写入 tmp，保留符号链接本身。
+
+        进度：-q -dg -ds 1m 让 Info-ZIP 只在 stdout 上每读 1 MB 输入打一个点（不再逐个列出
+        加入的文件），警告仍写在 stderr，读取被拒的识别不受影响。"""
         if self.password is not None:
             self._run_zip_encrypted(tmp)
             return
@@ -1471,10 +1964,14 @@ class ArchiveJob(Job):
             excludes += [p, f"*/{p}", f"{p}/*", f"*/{p}/*"]
         # -X 去掉额外属性，-y 存储链接而不沿链接遍历源目录之外的文件。
         cmd = [require_tool("zip", self.fmt.key), "-r", "-X", "-y", f"-{self.level}",
-               str(tmp), self._name, "-x", *excludes]
-        self._run_simple(cmd, tool="zip", cwd=self.src.parent)
-        if sys.platform == "darwin":
-            self._mark_zip_utf8(tmp)
+               "-q", "-dg", "-ds", "1m", str(tmp), self._name, "-x", *excludes]
+        self._progress.start("work", self._stats.total)
+        dots = [0]
+
+        def on_dots(chunk: bytes) -> None:
+            dots[0] += chunk.count(b".")
+            self._progress.update(dots[0] * _ZIP_DOT)
+        self._run_simple(cmd, tool="zip", cwd=self.src.parent, on_stdout=on_dots)
 
     def _run_zip_encrypted(self, tmp: Path) -> None:
         """用 bsdtar 写加密 zip。Info-ZIP 的 zip 只能从终端（-e）或命令行（-P）拿密码，
@@ -1489,7 +1986,8 @@ class ArchiveJob(Job):
         # 级别 0 存储不压缩；zip:compression-level 没写进 man 页，但 libarchive 3.7 支持。
         level = "zip:compression=store" if self.level == 0 else \
             f"zip:compression-level={self.level}"
-        cmd = [tar, "-c", "-f", str(tmp), "--format", "zip",
+        # -v：bsdtar 开始处理每一项时打印「a 名称」，按文件大小计进度（只能做到按文件）。
+        cmd = [tar, "-c", "-v", "-f", str(tmp), "--format", "zip",
                "--options", f"zip:encryption={self.zip_method},{level},zip:hdrcharset=UTF-8",
                "--no-mac-metadata", "--no-xattrs"]
         if self._name.startswith("./"):
@@ -1498,8 +1996,12 @@ class ArchiveJob(Job):
             cmd += ["-s", r",^\./,,HS"]
         for p in JUNK:
             cmd += ["--exclude", p]
-        self._run_simple(cmd + [self._name], tool="tar", cwd=self.src.parent,
-                         password=self.password)
+        self._track_verbose("a ", self._stats.sizes or {}, self._stats.total)
+        try:
+            self._run_simple(cmd + [self._name], tool="tar", cwd=self.src.parent,
+                             password=self.password)
+        finally:
+            self._verbose = None
 
     def _mark_zip_utf8(self, path: Path) -> None:
         """为 macOS zip 的 UTF-8 文件名补标记；只改头部，不重新压缩文件内容。"""
@@ -1532,16 +2034,20 @@ class ArchiveJob(Job):
 
     def _run_7z(self, tmp: Path) -> None:
         """生成 7z 递归排除参数并写入 tmp，拒绝有遗漏警告的归档。"""
-        # -snl 保存符号链接，-mmt=on 启用多线程，-bsp0 关闭百分比刷屏。
+        # -snl 保存符号链接，-mmt=on 启用多线程，-bsp1 输出百分比（用退格覆盖，记日志前去掉）。
         cmd = [require_tool("7z", self.fmt.key), "a", "-t7z", f"-mx={self.level}", "-mmt=on",
-               "-snl", "-bb1", "-bsp0", "-y", str(tmp), self._name]
+               "-snl", "-bb1", "-bsp1", "-y", str(tmp), self._name]
         # -xr! 对任意层级的文件名递归匹配，避免只排除顶层垃圾。
         cmd += [f"-xr!{p}" for p in JUNK]
         if self.password is not None:
             # 不带值的 -p 让 7-Zip 从标准输入读密码（AES-256）；-mhe 决定是否加密文件名。
             cmd[2:2] = ["-p", f"-mhe={'on' if self.encrypt_names else 'off'}"]
         # 退出码 1 可能表示部分文件未读到，_run_simple 会把它当作失败，不提交不完整的归档。
-        self._run_simple(cmd, tool="7z", cwd=self.src.parent, password=self.password)
+        # 7-Zip 的百分比按源的总字节换算，界面才能显示速度。
+        total = self._stats.total
+        self._progress.start("work", total)
+        self._run_simple(cmd, tool="7z", cwd=self.src.parent, password=self.password,
+                         on_chunk=self._percent_watcher(lambda pct: pct * total // 100))
 
 
 # ---------- 解压：提交与隔离属性 ----------
@@ -1722,6 +2228,23 @@ _BSDTAR_ZIP_UNSUPPORTED = re.compile(
     r"Inappropriate file type or format)$")
 
 
+def _zip_member_sizes(archive: Path) -> dict[str, int] | None:
+    """「成员名 → 解压后大小」，用于按 bsdtar -v 的输出计进度；名称与 bsdtar 打印的一致
+    （文件夹带结尾的 /）。工具排除的垃圾项不计入。中央目录读不了时返回 None。"""
+    try:
+        with open(archive, "rb") as f:
+            entries = _read_central_directory(f)
+    except (OSError, JobError):
+        return None
+    sizes: dict[str, int] = {}
+    for e in entries:
+        name = e.name.decode("utf-8", "replace")
+        if any(is_junk_name(part) for part in name.rstrip("/").split("/")):
+            continue
+        sizes[name] = e.usize
+    return sizes
+
+
 def _mentions_encryption(line: str, tool: str) -> bool:
     """判断 tool（"tar" 或 "7z"）输出的这一行是否在报告归档已加密。"""
     if tool == "7z":
@@ -1738,8 +2261,10 @@ class ExtractJob(Job):
     _new_session = True
 
     def __init__(self, archive: Path | str, dest: Path | str,
-                 log: Callable[[str], None] = print, *, password: str | None = None) -> None:
-        """archive 为归档路径，dest 为放置结果的文件夹，log 接收命令行和工具输出。
+                 log: Callable[[str], None] = print, *, password: str | None = None,
+                 progress: Callable[[str, int, int | None, str], None] | None = None) -> None:
+        """archive 为归档路径，dest 为放置结果的文件夹，log 接收命令行和工具输出，progress
+        接收进度（见 _Progress）。
 
         password 为 None 时遇到加密归档报 archive_encrypted，界面据此询问密码后带密码重试；
         密码不正确时报 archive_wrong_password，无法区分密码错误和数据损坏时报
@@ -1761,7 +2286,7 @@ class ExtractJob(Job):
         self._prompts = 0  # bsdtar 向标准输入要密码的次数
         self.archive = Path(archive).absolute()
         self.dest = Path(dest).absolute()
-        super().__init__(self._log_line)
+        super().__init__(self._log_line, progress)
         self.warnings: list[JobError] = []
         self.skipped = 0
 
@@ -1793,10 +2318,15 @@ class ExtractJob(Job):
         """校验、解压、整理并提交，返回放置后的路径；失败或取消时暂存目录整个删除。"""
         self._check_cancel()
         raise_fd_limit()
+        self._progress.start("prepare")
         if self.password is not None:
             check_password(self.password, None)
         self.archive = validate_archive(self.archive)
-        family = extract_family(self.archive)
+        try:
+            # 第一次实际读取归档内容：被隐私保护拦住时在这里暴露（stat 和 os.access 都看不出）。
+            family = extract_family(self.archive)
+        except PermissionError as exc:
+            raise _denied("src_denied", self.archive, exc.errno, write=False) from None
         fmt = _FORMAT_OF_FAMILY[family]
         missing = [t for t in extract_tools(family) if locate(t) is None]
         if missing:
@@ -1830,6 +2360,8 @@ class ExtractJob(Job):
             root.mkdir()
             self._extract(family, root)
             self._check_cancel()
+            self._progress.complete()
+            self._progress.start("finish")
             make_tree_accessible(root, self._check_cancel)
             self.skipped = sweep_junk(root, self._check_cancel)
             # exFAT、FAT 等不支持扩展属性的卷上，系统用「._名称」文件保存属性（例如
@@ -1878,16 +2410,29 @@ class ExtractJob(Job):
         """运行解压命令：tar.zst 走管道，其余先用 bsdtar，7z 解不了时改用 7-Zip。"""
         tar = require_tool("tar", _FORMAT_OF_FAMILY[family])
         excludes = [arg for p in JUNK for arg in ("--exclude", p)]
+        size = os.path.getsize(self.archive)
         if family == "zstd":
             # 本机 bsdtar 没有 libzstd，它会自己去 PATH 找 zstd；显式管道才能分别检查两端退出码。
             # tar 读到结束标记就会退出，zstd 可能读不到流末尾的校验和；先完整校验一遍，
             # 损坏的数据不会被当成成功解出（zstd 解码很快，这一遍的代价不大）。
+            # 两遍都由这里喂 zstd 的标准输入并计数，进度总量是两倍的归档大小。
             zstd = require_tool("zstd", "tar.zst")
-            self._run_simple([zstd, "-t", "-q", str(self.archive)], tool="zstd", cwd=root)
-            self._run_pipeline([zstd, "-d", "-c", "-q", str(self.archive)],
+            self._progress.start("work", 2 * size)
+            self._run_simple([zstd, "-t", "-q", "-"], tool="zstd", cwd=root, feed=self.archive,
+                             meter=self._progress.update)
+            self._run_pipeline([zstd, "-d", "-c", "-q", "-"],
                                [tar, "-x", "-f", "-", *_BSDTAR_EXTRACT, *_NO_PASSWORD, *excludes],
                                tools=("zstd", "tar"), cwd=root, stdout=subprocess.DEVNULL,
-                               blame_downstream=False)
+                               blame_downstream=False, feed=self.archive,
+                               meter=lambda n: self._progress.update(size + n))
+            return
+        if family in ("tar", "gzip", "xz") and self.password is None:
+            # 流式格式：由这里从标准输入喂归档并计数，进度是已读的归档字节（与从文件读相比，
+            # 报错原文相同，2026-11-09 实测）。
+            self._progress.start("work", size)
+            self._run_simple([tar, "-x", "-f", "-", *_BSDTAR_EXTRACT, *_NO_PASSWORD, *excludes],
+                             tool="tar", cwd=root, stdout=subprocess.DEVNULL, feed=self.archive,
+                             meter=self._progress.update)
             return
         # 名为 .7z、实为带前置数据的 zip 时，中央目录已经说明它是加密 zip，按 zip 处理。
         if family == "7z" and self.password is not None and not self._zip_encrypted:
@@ -1898,10 +2443,17 @@ class ExtractJob(Job):
             self._run_7z_fallback(self._require_7z("archive_zip_needs_7z"), root)
             return
         try:
-            self._run_simple([tar, "-x", "-f", str(self.archive), *_BSDTAR_EXTRACT,
-                              *(_NO_PASSWORD if self.password is None else []), *excludes],
-                             tool="tar", cwd=root, stdout=subprocess.DEVNULL,
-                             password=self.password)
+            verbose = self._watch_members(family, tar, root)
+            try:
+                with self._polling(root):
+                    self._run_simple([tar, "-x", *(["-v"] if verbose else []), "-f",
+                                      str(self.archive), *_BSDTAR_EXTRACT,
+                                      *(_NO_PASSWORD if self.password is None else []),
+                                      *excludes],
+                                     tool="tar", cwd=root, stdout=subprocess.DEVNULL,
+                                     password=self.password)
+            finally:
+                self._verbose = None
             return
         except JobError as exc:
             if self._encrypted:
@@ -1925,6 +2477,55 @@ class ExtractJob(Job):
                 raise
             self.log("→ 7z")
         self._run_7z_fallback(seven, root)
+
+    def _watch_members(self, family: str, tar: str, root: Path) -> bool:
+        """准备按 bsdtar -v 计进度（zip、7z 不能从标准输入读，只能这样），返回是否加 -v。
+
+        zip 按中央目录里每个成员解压后的大小计；7z 先列一次成员（目录在文件尾，很快），按项数
+        计。有密码时不加 -v：bsdtar 的密码提示会粘在「x 名称」后面，「第二次要密码就结束它」
+        的防护按行首数提示（设计决策 25），不能冒这个险，这时进度不确定。"""
+        if self.password is None:
+            sizes = _zip_member_sizes(self.archive) if family != "7z" else None
+            if sizes:
+                self._track_verbose("x ", sizes, sum(sizes.values()) or None)
+                return True
+            if family == "7z":
+                excludes = [arg for p in JUNK for arg in ("--exclude", p)]
+                rc, out = self._run_capture([tar, "-t", "-f", str(self.archive), *_NO_PASSWORD,
+                                             *excludes])
+                names = [line for line in out.splitlines() if line]
+                if rc == 0 and names:
+                    self._track_verbose("x ", dict.fromkeys(names, 1), len(names), "items")
+                    return True
+        self._progress.start("work")
+        return False
+
+    @contextlib.contextmanager
+    def _polling(self, root: Path) -> Iterator[None]:
+        """按 -v 的字节计进度时，定时查看正在写的那一项已写了多少：bsdtar 写完一项才换行，
+        解一个大文件期间进度要靠这个推进。"""
+        if self._verbose is None or self._progress.unit != "bytes":
+            yield
+            return
+        stop = threading.Event()
+
+        def run() -> None:
+            while not stop.wait(0.2):
+                name, sizes = self._current, self._verbose
+                if name is None or sizes is None:
+                    continue
+                try:
+                    written = os.lstat(root / name).st_size
+                except OSError:
+                    continue
+                self._progress.update(self._verbose_done + min(written, sizes.get(name, 0)))
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            t.join()
 
     def _require_7z(self, key: str) -> str:
         """返回 7-Zip 的路径；没有安装时以 key 报告为什么需要它。"""
@@ -1957,12 +2558,15 @@ class ExtractJob(Job):
         # 解的是 zip 时指定 -tzip：7-Zip 按扩展名选格式，名为 .zip、开头带前置数据的归档
         # 不指定就打不开（名为 .7z 的反而会按内容找到 zip）。
         is_zip = self._family == "zip" or self._zip_encrypted or self._zip_unsupported
-        cmd = [seven, "x", "-y", "-bsp0", "-bb1", "-snld", "-spd",
+        # -bsp1：7-Zip 自己的百分比（用退格覆盖，记日志前去掉），按百分比计进度。
+        self._progress.start("work", 100, "percent")
+        cmd = [seven, "x", "-y", "-bsp1", "-bb1", "-snld", "-spd",
                *(["-tzip"] if is_zip else []),
                *(["-p"] if self.password is None else []), f"-o{root}",
                *[f"-xr!{p}" for p in JUNK], str(self.archive)]
         try:
-            self._run_simple(cmd, tool="7z", cwd=root, password=self.password)
+            self._run_simple(cmd, tool="7z", cwd=root, password=self.password,
+                             on_chunk=self._percent_watcher(lambda pct: pct))
         except JobError as exc:
             if self._encrypted and self._zip_strong and self.password is not None \
                     and len(self.password.encode("utf-8")) > PASSWORD_MAX:

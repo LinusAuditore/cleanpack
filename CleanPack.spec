@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """构建带应用图标、版本信息和许可证的 macOS 应用。"""
+import plistlib
 import sys
 import sysconfig
 from pathlib import Path
@@ -10,6 +11,28 @@ from macholib.mach_o import LC_BUILD_VERSION, LC_VERSION_MIN_MACOSX
 # 名称、版本和 bundle id 只在 core.py 中定义一次；core 不依赖 Qt，导入时只构建子进程环境。
 sys.path.insert(0, SPECPATH)
 from core import APP_NAME, APP_VERSION, BUNDLE_ID  # noqa: E402
+from i18n import STRINGS  # noqa: E402  i18n 只有文案字典，不依赖 Qt
+
+# 首次访问桌面、文稿、下载、外置卷和网络卷时，系统同意框里显示的用途说明。英文写进
+# Info.plist，各语言的译文放在 Contents/Resources/<语言>.lproj/InfoPlist.strings，
+# 由系统按 macOS 的语言选择；文案来自 i18n.py，不在别处另写一份。
+USAGE_KEYS = ('NSDesktopFolderUsageDescription', 'NSDocumentsFolderUsageDescription',
+              'NSDownloadsFolderUsageDescription', 'NSRemovableVolumesUsageDescription',
+              'NSNetworkVolumesUsageDescription')
+LPROJ = {'en': 'en', 'zh_Hans': 'zh-Hans', 'zh_Hant': 'zh-Hant', 'fr': 'fr'}  # 与本地化列表一致
+
+
+def usage_strings() -> list[tuple[str, str]]:
+    """在 build/ 下生成各语言的 InfoPlist.strings，返回 datas 条目。strings 文件也可以是
+    属性列表格式，用 plistlib 写出就不必处理引号和转义。"""
+    entries = []
+    for lang, folder in LPROJ.items():
+        target = Path(workpath, 'lproj', f'{folder}.lproj', 'InfoPlist.strings')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        text = STRINGS[lang]['usage_files']
+        target.write_bytes(plistlib.dumps({key: text for key in USAGE_KEYS}))
+        entries.append((str(target), f'{folder}.lproj'))
+    return entries
 
 # 随应用分发的许可证文件；任何一个缺失都让构建失败，而不是悄悄发布缺少许可证的产物。
 LICENSE_FILES = ['LICENSE', 'licenses/THIRD_PARTY_NOTICES.md', 'licenses/LGPL-3.0.txt',
@@ -19,7 +42,8 @@ for required in [*(Path(SPECPATH, f) for f in LICENSE_FILES), PYTHON_LICENSE]:
     if not required.is_file():
         raise SystemExit(f"找不到许可证文件：{required}")
 
-# 程序只用 QtCore、QtGui 和 QtWidgets。PyInstaller 收集 QtGui 插件时会带入虚拟键盘输入法插件
+# 程序只用 QtCore、QtGui、QtWidgets 和 QtSvg（theme.py 用 QSvgRenderer 画图标）。
+# PyInstaller 收集 QtGui 插件时会带入虚拟键盘输入法插件
 # 和 PDF 图片格式插件，进而拖入只以 GPL-3.0 授权的 QtVirtualKeyboard 以及 Quick/QML/PDF 模块，
 # 这里把它们排除，避免发布用不到的 GPL 组件。
 UNUSED_QT = ('libqtvirtualkeyboardplugin', 'libqpdf', 'QtVirtualKeyboard', 'QtQuick',
@@ -55,8 +79,10 @@ a = Analysis(
     pathex=[],
     binaries=[],
     # 让项目许可证和第三方许可证随二进制产物分发，保留版权声明、许可条件及免责声明。
+    # 界面图标（theme.py 从 sys._MEIPASS/assets/icons 读取）也作为数据文件打包。
     datas=[(f, str(Path(f).parent)) for f in LICENSE_FILES]
-          + [(str(PYTHON_LICENSE), 'licenses/Python')],
+          + [(str(PYTHON_LICENSE), 'licenses/Python')] + usage_strings()
+          + [('assets/icons/*.svg', 'assets/icons')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -112,5 +138,6 @@ app = BUNDLE(
         'CFBundleLocalizations': ['en', 'zh-Hans', 'zh-Hant', 'fr'],
         'NSHumanReadableCopyright': 'Copyright 2026 Xinghao Zuo',
         'LSMinimumSystemVersion': MIN_MACOS,
+        **{key: STRINGS['en']['usage_files'] for key in USAGE_KEYS},
     },
 )

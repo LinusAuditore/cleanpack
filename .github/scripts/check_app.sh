@@ -19,6 +19,22 @@ for f in LICENSE licenses/THIRD_PARTY_NOTICES.md licenses/LGPL-3.0.txt licenses/
     [[ -f "$app/Contents/Resources/$f" ]] || fail "missing $f"
 done
 
+# 访问受保护位置时系统同意框里的用途说明：Info.plist 有英文，四种语言各有 InfoPlist.strings。
+for key in NSDesktopFolderUsageDescription NSDocumentsFolderUsageDescription \
+           NSDownloadsFolderUsageDescription NSRemovableVolumesUsageDescription \
+           NSNetworkVolumesUsageDescription; do
+    [[ -n "$(plutil -extract "$key" raw "$plist")" ]] || fail "missing $key"
+    for lang in en zh-Hans zh-Hant fr; do
+        strings_file="$app/Contents/Resources/$lang.lproj/InfoPlist.strings"
+        [[ -n "$(plutil -extract "$key" raw "$strings_file")" ]] || fail "missing $key in $lang.lproj"
+    done
+done
+
+# 界面图标（theme.py 运行时读取）：仓库里的每个 SVG 都要打包进去。
+for svg in assets/icons/*.svg; do
+    [[ -f "$app/Contents/Resources/$svg" ]] || fail "missing $svg"
+done
+
 codesign --verify --deep --strict "$app" || fail "codesign --verify"
 
 # spec 排除了虚拟键盘、Quick/QML/PDF 等模块，这里确认实际只剩这六个。

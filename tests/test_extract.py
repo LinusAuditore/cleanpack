@@ -503,6 +503,19 @@ class SafetyTests(ExtractBase):
         path = self.tar_with("fifo.tar", [("a.txt", b"a"), self.info("p", tarfile.FIFOTYPE)])
         self.assert_fails(path, "unsafe_entry")
 
+    @unittest.skipIf(os.geteuid() == 0, "root 能创建设备文件")
+    def test_device_entry_is_not_a_privacy_problem(self) -> None:
+        """普通用户不能创建设备文件，bsdtar 报 Operation not permitted 并失败。这与隐私保护
+        无关，不能提示用户去系统设置里授权。"""
+        self.require("tar")
+        device = self.info("top/null", tarfile.CHRTYPE)
+        device.devmajor, device.devminor = 3, 2
+        path = self.tar_with("dev.tar", [("top/a.txt", b"a"), device])
+        with self.assertRaises(core.JobError) as caught:
+            core.ExtractJob(path, self.dest, log=silent).run()
+        self.assertEqual((caught.exception.key, caught.exception.denial), ("tool_failed", None))
+        self.assert_dest_untouched()
+
     def test_locked_dirs_are_committed(self) -> None:
         """目录条目在前、内容在后，bsdtar 会先建出 000/0500 的目录（实测文件仍能写入，
         目录权限在结束时才设置）；补上 u+rwx 后整理和提交都要成功。"""

@@ -1,20 +1,19 @@
-"""GUI 公用的 Qt 辅助：子进程环境、样式、Qt 翻译、本地化数字、确认与密码对话框和可键入的路径框。"""
+"""GUI 公用的 Qt 辅助：子进程环境、样式、Qt 翻译、本地化数字、确认与密码对话框、
+可键入的路径框，以及访问被拒时的补救（打开系统设置的隐私页面）。"""
 from __future__ import annotations
 
+import sys
 from typing import Any, Callable
 
-from PySide6.QtCore import (QCoreApplication, QLibraryInfo, QLocale, QProcessEnvironment, Qt,
-                            QTimer, QTranslator, Signal)
-from PySide6.QtGui import QFocusEvent
-from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QLabel, QLineEdit,
-                               QMessageBox, QVBoxLayout, QWidget)
+from PySide6.QtCore import (QCoreApplication, QEvent, QLibraryInfo, QLocale,
+                            QProcessEnvironment, Qt, QTimer, QTranslator, QUrl, Signal)
+from PySide6.QtGui import QDesktopServices, QFocusEvent
+from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
+                               QLineEdit, QMessageBox, QPushButton, QVBoxLayout, QWidget)
 
 import core
+import theme
 from i18n import QT_LOCALES, current_lang, tr
-
-# 说明文字和警告使用系统文字色，保证浅色和深色主题下都有足够对比度。
-NOTE_STYLE = "color: palette(text);"
-WARN_STYLE = "color: palette(text); font-weight: bold;"
 
 # 当前安装的 Qt 自带文案翻译；必须保持引用，否则对象被回收后翻译失效。
 _qt_translator: QTranslator | None = None
@@ -68,6 +67,58 @@ def format_secs(secs: float) -> str:
     return app_locale().toString(secs, "f", 1)
 
 
+def format_eta(seconds: float) -> str:
+    """剩余时间，取整方式见 core.eta_parts；数字随界面语言格式化。"""
+    h, m, s = core.eta_parts(seconds)
+    n = app_locale().toString
+    if h:
+        return tr("eta_hours", h=n(h), m=n(m))
+    if m:
+        return tr("eta_minutes", m=n(m), s=n(s)) if s else tr("eta_minutes_only", m=n(m))
+    return tr("eta_seconds", s=n(s))
+
+
+# 进度标签里各部分之间的分隔符。
+PROGRESS_SEP = " · "
+
+
+def format_progress(phase: str, done: int, total: int | None, unit: str,
+                    rate: float | None, eta: float | None) -> str:
+    """进度条旁的文字：统计、准备、整理阶段说明在做什么；工具运行中显示百分比，按字节计时
+    再加速度，最后是剩余时间（还估不出时说正在估算）。总量未知时不显示。"""
+    if phase in ("scan", "prepare", "finish"):
+        return tr({"scan": "progress_scanning", "prepare": "progress_preparing",
+                   "finish": "progress_finishing"}[phase])
+    if not total:
+        return ""
+    parts = [tr("progress_percent", n=app_locale().toString(min(100, done * 100 // total)))]
+    if unit == "bytes" and rate:
+        parts.append(tr("progress_speed", size=format_size(int(rate))))
+    parts.append(format_eta(eta) if eta is not None else tr("progress_estimating"))
+    return PROGRESS_SEP.join(parts)
+
+
+# 「系统设置 ▸ 隐私与安全 ▸ 文件与文件夹」。macOS 13 起的写法；锚点 Privacy_FilesAndFolders
+# 没有文档，只在系统设置的二进制里出现，打不开时退回只打开「隐私与安全」。不引导用户去
+# 「完全磁盘访问权限」：Apple 建议用打开面板或文件与文件夹授权，那个权限范围过大。
+PRIVACY_SETTINGS_URLS = (
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"
+    "?Privacy_FilesAndFolders",
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
+)
+
+
+def open_privacy_settings() -> bool:
+    """打开系统设置的隐私页面，返回是否成功交给系统打开。"""
+    return any(QDesktopServices.openUrl(QUrl(url)) for url in PRIVACY_SETTINGS_URLS)
+
+
+def privacy_help() -> str:
+    """说明怎样解除隐私保护的拦截。从源码运行时，macOS 检查的是启动 CleanPack 的应用
+    （例如终端），要在系统设置里允许的是它，打包后的应用才算 CleanPack 自己。"""
+    return tr("privacy_help" if getattr(sys, "frozen", False) else "privacy_help_dev")
+
+
 def confirm(parent: QWidget, title: str, text: str, accept_key: str) -> bool:
     """显示确认对话框并返回是否确认；默认按钮和 Esc 都是取消，按钮文字跟随应用语言。"""
     box = QMessageBox(QMessageBox.Icon.Question, title, text, parent=parent)
@@ -87,6 +138,7 @@ def ask_password(parent: QWidget, text: str, error: str | None = None) -> str | 
     确定按钮不可用；输入了内容才显示原因，空着时只停用按钮。
     """
     dlg = QDialog(parent)
+    theme.set_role(dlg, "dialog")
     dlg.setWindowTitle(tr("password_title"))
     # 默认宽度只有两百像素左右，归档名稍长说明就会一行只剩几个字。
     dlg.setMinimumWidth(380)
@@ -97,7 +149,7 @@ def ask_password(parent: QWidget, text: str, error: str | None = None) -> str | 
     if error:
         err_lbl = QLabel(error)
         err_lbl.setWordWrap(True)
-        err_lbl.setStyleSheet(WARN_STYLE)
+        theme.set_role(err_lbl, "warn")
         layout.addWidget(err_lbl)
     field = QLineEdit()
     field.setEchoMode(QLineEdit.EchoMode.Password)
@@ -109,7 +161,7 @@ def ask_password(parent: QWidget, text: str, error: str | None = None) -> str | 
     layout.addWidget(show)
     hint = QLabel()
     hint.setWordWrap(True)
-    hint.setStyleSheet(WARN_STYLE)
+    theme.set_role(hint, "warn")
     hint.hide()
     layout.addWidget(hint)
     buttons = QDialogButtonBox()
@@ -161,6 +213,7 @@ class PathInput(QLineEdit):
     """
     committed = Signal(object)  # 提交后的解析结果；不合格时为 None，原因见 error
     checked = Signal()          # 草稿的校验结果已更新
+    fix_requested = Signal(object)  # 点按了提示旁的补救按钮，参数是带 denial 的 JobError
 
     DEBOUNCE_MS = 200
 
@@ -173,10 +226,26 @@ class PathInput(QLineEdit):
         self._committed_ok = True
         # 拖放由窗口统一处理，避免输入框截获文件 URL。
         self.setAcceptDrops(False)
+        # 窗口缩窄时路径框至少能显示一段路径，不被挤成几个字符。顶栏标题可以省略之后，这也是
+        # 主窗口最小宽度的主要来源，同一行的级别滑块因此也留得出能拖动的轨道。
+        self.setMinimumWidth(160)
         self.hint = QLabel()
         self.hint.setWordWrap(True)
-        self.hint.setStyleSheet(WARN_STYLE)
+        theme.set_role(self.hint, "warn")
         self.hint.hide()
+        # 访问被拒时提示旁的补救按钮：隐私保护给「授予访问权限…」，POSIX 权限和锁定给
+        # 「在访达中显示」，方便用「显示简介」修改；系统保护的位置没有补救办法，不显示。
+        self.fix_btn = QPushButton()
+        theme.set_button(self.fix_btn, "text")
+        self.fix_btn.hide()
+        self.fix_btn.clicked.connect(self._request_fix)
+        # 调用方把 hint_row（而不是 hint）放进布局，提示和按钮在同一行。
+        self.hint_row = QWidget()
+        row = QHBoxLayout(self.hint_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.hint, 1)
+        row.addWidget(self.fix_btn, 0, Qt.AlignmentFlag.AlignTop)
+        self.hint_row.hide()
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(self.DEBOUNCE_MS)
@@ -264,8 +333,33 @@ class PathInput(QLineEdit):
     def retranslate(self) -> None:
         self._render()
 
+    def changeEvent(self, e: QEvent) -> None:
+        """输入框停用（任务进行中或还没有可用的值）时补救按钮一起停用，与拖放规则一致。"""
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.EnabledChange:
+            self.fix_btn.setEnabled(self.isEnabled())
+
+    def problem(self) -> core.JobError | None:
+        """当前显示的问题：文字本身的错误优先，其次是调用方给出的附加提示。"""
+        return self.error or self.note
+
     def _render(self) -> None:
-        err = self.error or self.note
+        err = self.problem()
         text = tr(err.key, **err.kw) if err else ""
         self.hint.setText(text)
         self.hint.setVisible(bool(text))
+        fix = _FIX_LABELS.get(err.denial) if err else None
+        if fix:
+            self.fix_btn.setText(tr(fix))
+        self.fix_btn.setVisible(bool(fix))
+        self.hint_row.setVisible(bool(text))
+        # M3 文本框的错误状态：有提示时描边变成 error 色。
+        theme.set_error(self, bool(text))
+
+    def _request_fix(self) -> None:
+        if (err := self.problem()) is not None and err.denial in _FIX_LABELS:
+            self.fix_requested.emit(err)
+
+
+# 访问被拒的原因对应的补救按钮文案；system 没有补救办法。
+_FIX_LABELS = {"privacy": "grant_access", "posix": "show_in_finder", "locked": "show_in_finder"}

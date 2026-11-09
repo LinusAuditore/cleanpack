@@ -64,6 +64,8 @@ def visible(widget) -> bool:
 
 
 app = QApplication([])
+import theme  # noqa: E402
+theme.apply(app)  # 与 main.main() 一样套用 M3 主题，夹具测的才是实际界面
 tmp = Path(tempfile.mkdtemp(prefix="cleanpack-gui6b-", dir="/tmp"))
 # 中途失败也删掉测试数据（进程被信号杀死时除外）。
 atexit.register(lambda: (subprocess.run(["chmod", "-R", "u+rwx", str(tmp)], check=False),

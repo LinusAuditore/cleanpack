@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import core  # noqa: E402
 import main  # noqa: E402
+import theme  # noqa: E402
 from i18n import set_lang  # noqa: E402
 
 src, ini = sys.argv[1], sys.argv[2]
@@ -24,6 +25,8 @@ mode = sys.argv[5] if len(sys.argv) > 5 else "compress"
 app = QApplication(sys.argv[:1])
 app.setApplicationName(core.APP_NAME)
 settings = QSettings(ini, QSettings.IniFormat)
+# 与 main.main() 一样按保存的「显示 ▸ 外观」设置配色（没有保存时跟随系统）。
+theme.set_appearance(app, main.appearance_pref(settings))
 settings.setValue("format", fmt)
 settings.setValue("mode", mode)
 set_lang(lang)

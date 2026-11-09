@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (QDialog, QGridLayout, QHBoxLayout, QLabel, QLineE
                                QVBoxLayout, QWidget)
 
 import core
-from gui_common import NOTE_STYLE, WARN_STYLE, process_environment
+import theme
+from gui_common import process_environment
 from i18n import tr
 
 
@@ -163,6 +164,8 @@ class ToolsDialog(QDialog):
         # 拖放统一由主窗口处理，工具链窗口不接收文件。
         self.setAcceptDrops(False)
         root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
         root.addWidget(self._build_brew_section())
         root.addLayout(self._build_tool_grid())
         root.addLayout(self._build_install_row())
@@ -170,13 +173,14 @@ class ToolsDialog(QDialog):
         close_row = QHBoxLayout()
         close_row.addStretch()
         self.btn_close = QPushButton()
+        theme.set_button(self.btn_close, "text")
         self.btn_close.clicked.connect(self.hide)
         close_row.addWidget(self.btn_close)
         root.addLayout(close_row)
         tools.changed.connect(self.update_state)
         tools.output.connect(self.append_output)
         tools.status.connect(self.append_output)
-        self.resize(640, 560)
+        self.resize(760, 560)
         self.retranslate()
 
     # ---------- 界面 ----------
@@ -188,11 +192,13 @@ class ToolsDialog(QDialog):
         self.brew_lbl = QLabel()
         self.brew_hint = QLabel()
         self.brew_hint.setWordWrap(True)
-        self.brew_hint.setStyleSheet(NOTE_STYLE)
+        theme.set_role(self.brew_hint, "note")
         self.brew_hint.setTextInteractionFlags(Qt.TextSelectableByMouse)
         row = QHBoxLayout()
         self.btn_site = QPushButton()
         self.btn_copy_brew = QPushButton()
+        theme.set_icon(self.btn_site, "open_in_new")
+        theme.set_icon(self.btn_copy_brew, "content_copy")
         self.btn_site.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://brew.sh")))
         self.btn_copy_brew.clicked.connect(lambda: self.copy_text(core.BREW_INSTALL_CMD))
         row.addWidget(self.btn_site)
@@ -207,17 +213,31 @@ class ToolsDialog(QDialog):
         return box
 
     def _build_tool_grid(self) -> QGridLayout:
-        """每个工具一行：状态、用途、路径或安装命令。"""
+        """每个工具一行：状态（图标加文字）、用途、路径或安装命令。
+
+        状态用 Material Symbols 图标而不是 Emoji：就绪是 primary 色的 check_circle，缺失是
+        error 色的 error；图标随外观重新着色，文字照常说明状态（不只靠颜色区分）。
+        """
         grid = QGridLayout()
         self.tool_rows: dict[str, tuple[QLabel, QLabel, QLabel]] = {}
+        self.tool_icons: dict[str, QLabel] = {}
         for i, key in enumerate(core.TOOLS):
             name, status, used, path = QLabel(f"<b>{key}</b>"), QLabel(), QLabel(), QLabel()
+            icon = QLabel()
             path.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            path.setStyleSheet(NOTE_STYLE)
-            for col, w in enumerate((name, status, used, path)):
-                grid.addWidget(w, i, col)
+            theme.set_role(path, "note")
+            cell = QHBoxLayout()
+            cell.setSpacing(6)
+            cell.addWidget(icon)
+            cell.addWidget(status, 1)
+            grid.addWidget(name, i, 0)
+            grid.addLayout(cell, i, 1)
+            grid.addWidget(used, i, 2)
+            grid.addWidget(path, i, 3)
             self.tool_rows[key] = (status, used, path)
+            self.tool_icons[key] = icon
         grid.setColumnStretch(3, 1)
+        grid.setHorizontalSpacing(16)
         return grid
 
     def _build_install_row(self) -> QVBoxLayout:
@@ -228,12 +248,18 @@ class ToolsDialog(QDialog):
         self.cmd_edit.setAcceptDrops(False)
         self.note_lbl = QLabel()
         self.note_lbl.setWordWrap(True)
-        self.note_lbl.setStyleSheet(WARN_STYLE)
+        theme.set_role(self.note_lbl, "warn")
         h = QHBoxLayout()
         self.btn_install = QPushButton()
         self.btn_cancel = QPushButton()
         self.btn_copy = QPushButton()
         self.btn_refresh = QPushButton()
+        # 窗口的主操作是安装（实心按钮）；重新检测是次要操作（文字按钮）。
+        theme.set_button(self.btn_install, "filled")
+        theme.set_icon(self.btn_install, "download")
+        theme.set_icon(self.btn_copy, "content_copy")
+        theme.set_button(self.btn_refresh, "text")
+        theme.set_icon(self.btn_refresh, "refresh")
         self.btn_install.clicked.connect(self.tools.install)
         self.btn_cancel.clicked.connect(self.tools.cancel_install)
         self.btn_copy.clicked.connect(lambda: self.copy_text(self.cmd_edit.text()))
@@ -246,7 +272,7 @@ class ToolsDialog(QDialog):
         self.progress.setRange(0, 0)
         self.bg_note = QLabel()
         self.bg_note.setWordWrap(True)
-        self.bg_note.setStyleSheet(NOTE_STYLE)
+        theme.set_role(self.bg_note, "note")
         v.addWidget(self.cmd_edit)
         v.addWidget(self.note_lbl)
         v.addLayout(h)
@@ -291,7 +317,11 @@ class ToolsDialog(QDialog):
         self.brew_actions.setVisible(tools.brew is None)
         for key, (status, used, path_lbl) in self.tool_rows.items():
             tool, p = core.TOOLS[key], tools.paths.get(key)
-            text = f"✅ {tr('tool_ok')}" if p else f"❌ {tr('tool_missing')}"
+            text = tr("tool_ok") if p else tr("tool_missing")
+            if p:
+                theme.set_label_icon(self.tool_icons[key], "check_circle", "primary", 18)
+            else:
+                theme.set_label_icon(self.tool_icons[key], "error", "error", 18)
             # 按实际路径判断是否系统自带：PATH 中 Homebrew 目录在前时可能找到 Homebrew 的版本。
             if p and core.is_system_path(p):
                 text += f" ({tr('system_tool')})"
@@ -330,7 +360,10 @@ class ToolsDialog(QDialog):
         self.append_output(tr("copied"))
 
     def show_and_raise(self) -> None:
+        # 打开时焦点放在窗口本身，不放在任何控件上：否则 Qt 交给第一个可获得焦点的控件（只读的
+        # 命令框或日志），M3 的焦点描边让它像在等待输入。按 Tab 照常进入控件。
         self.show()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
         self.raise_()
         self.activateWindow()
 
