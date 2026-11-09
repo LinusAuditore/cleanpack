@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterator
 
 APP_NAME = "CleanPack"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 BUNDLE_ID = "io.github.linusauditore.cleanpack"
 
 # 每个任务在输出目录下独占的暂存目录名形如 .cleanpack-XXXX.part
