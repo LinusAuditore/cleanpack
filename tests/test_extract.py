@@ -837,6 +837,34 @@ class FailureTests(ExtractBase):
             job.run()
         self.assertEqual(caught.exception.kw.get("tool"), "tar")
 
+    def test_zst_decoder_epipe_exit_is_not_a_failure(self) -> None:
+        """tar 先退出后，zstd 写管道被拒时可能不是被 SIGPIPE 杀死，而是自己以 70 退出
+        （机器繁忙时常见）。这只是连带结果：结束标记之后带填充的归档照常成功，内容不是 tar
+        时报告 tar。用 sh 包一层，在真正的 zstd 结束后固定以 70 退出，结果不依赖机器负载。"""
+        self.require("tar", "zstd")
+        data = os.urandom(200_000)
+        padded = self.zst("epipe-pad.tar.zst",
+                          self.tar_bytes("e/a.bin", data) + b"\0" * 4_000_000)
+        notar = self.zst("epipe-notar.tar.zst", os.urandom(2_000_000))
+        for archive, expect in ((padded, None), (notar, "tar")):
+            with self.subTest(archive=archive.name):
+                job = core.ExtractJob(archive, self.dest, log=silent)
+                spawn = job._spawn
+
+                def epipe_zstd(cmd: list[str], **kwargs: object) -> subprocess.Popen:
+                    if kwargs.get("tool") == "zstd" and "-d" in cmd:
+                        cmd = ["/bin/sh", "-c", '"$@"; exit 70', "sh", *cmd]
+                    return spawn(cmd, **kwargs)
+
+                with patch.object(job, "_spawn", side_effect=epipe_zstd):
+                    if expect is None:
+                        result = job.run()
+                        self.assertEqual((result / "a.bin").read_bytes(), data)
+                    else:
+                        with self.assertRaises(core.JobError) as caught:
+                            job.run()
+                        self.assertEqual(caught.exception.kw.get("tool"), expect)
+
     def assert_fails_keep(self, archive: Path, key: str) -> None:
         """与 assert_fails 相同，但允许目标文件夹里已有之前用例放进去的结果。"""
         before = set(os.listdir(self.dest))

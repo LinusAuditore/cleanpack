@@ -7,6 +7,7 @@ import io
 import os
 from pathlib import Path
 import shlex
+import signal
 import stat
 import struct
 import subprocess
@@ -484,6 +485,25 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(caught.exception.key, "tool_failed")
         self.assertEqual(caught.exception.kw, {"tool": "gzip", "code": 3})
         self.assertEqual(self.staging_left(), [])
+
+    def test_blame_ignores_broken_pipe_upstream_when_extracting(self) -> None:
+        """解压方向上游写管道被拒（SIGPIPE 或 zstd 的写入错误码 70）是连带结果；
+        别的退出码照常报告。压缩方向的归咎不受影响。"""
+        sigpipe = -signal.SIGPIPE
+        cases = [
+            ([("zstd", 70), ("tar", 1)], ("tar", 1)),
+            ([("zstd", sigpipe), ("tar", 1)], ("tar", 1)),
+            ([("zstd", 70), ("tar", 0)], None),
+            ([("zstd", sigpipe), ("tar", 0)], None),
+            ([("zstd", 1), ("tar", 0)], ("zstd", 1)),
+            ([("zstd", 1), ("tar", 1)], ("zstd", 1)),
+        ]
+        for results, expected in cases:
+            with self.subTest(results=results):
+                self.assertEqual(core._blame(results, downstream=False), expected)
+        # 70 只对 zstd 有这层含义；压缩方向两端都失败时仍报下游。
+        self.assertEqual(core._blame([("gzip", 70), ("tar", 0)], downstream=False), ("gzip", 70))
+        self.assertEqual(core._blame([("tar", 1), ("zstd", 70)], downstream=True), ("zstd", 70))
 
     def test_warning_exit_does_not_commit_archive(self) -> None:
         """7z 的退出码 1 也可能遗漏文件，必须保留旧输出并报告失败。"""

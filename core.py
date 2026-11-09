@@ -1286,6 +1286,17 @@ def _send_password(proc: subprocess.Popen, password: str) -> None:
         proc.stdin.close()
 
 
+# 工具写管道遇到 EPIPE（下游已退出）时自己退出所用的退出码。zstd 先打印
+# “zstd: error 70 : Write error : cannot write block : Broken pipe”，随后要么被 SIGPIPE
+# 杀死，要么在信号送达前以 70 退出，两种都会出现（2026-11-09 实测，机器越忙后者越多）。
+_EPIPE_EXIT = {"zstd": 70}
+
+
+def _broken_pipe(tool: str, rc: int) -> bool:
+    """这个退出码是否表示工具只是因为下游关闭了管道才失败。"""
+    return rc == -signal.SIGPIPE or rc == _EPIPE_EXIT.get(tool)
+
+
 def _blame(results: list[tuple[str, int]], downstream: bool) -> tuple[str, int] | None:
     """从管道各段 (工具, 退出码) 中找出应报告的失败段；全部成功时返回 None。
 
@@ -1294,9 +1305,10 @@ def _blame(results: list[tuple[str, int]], downstream: bool) -> tuple[str, int] 
     为 False 时归咎最上游：解压管道里数据损坏会让下游的 tar 也跟着失败。
     """
     if not downstream:
-        # 解压方向：tar 读到结束标记或出错就会退出，上游的解码器写管道时被 SIGPIPE 杀死只是
+        # 解压方向：tar 读到结束标记或出错就会退出，上游的解码器再写管道只会被拒，这只是
         # 连带结果。数据本身是否完整由调用方事先校验（例如 zstd -t）。
-        results = [(tool, rc) for tool, rc in results if rc != -signal.SIGPIPE]
+        results = [(tool, rc) for tool, rc in results[:-1] if not _broken_pipe(tool, rc)] \
+            + results[-1:]
     failed = [(tool, rc) for tool, rc in results if rc]
     if not failed:
         return None

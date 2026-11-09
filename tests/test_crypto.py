@@ -330,7 +330,16 @@ class WrongPasswordTests(CryptoBase):
                 self.assertTrue(core.zip_is_encrypted(out))
                 strength = "strong" if "aes" in out.name.lower() else "weak"
                 self.assertEqual(core.check_zip_password(out, PASSWORD), strength)
-                self.assertEqual(core.check_zip_password(out, "wrong"), "wrong")
+                if strength == "strong":
+                    self.assertEqual(core.check_zip_password(out, "wrong"), "wrong")
+                else:
+                    # ZipCrypto 的加密头每次随机生成，预检接受两种校验字节，单个错误密码约有
+                    # 2/256 的概率通过校验而得到 weak（设计决策 26，无法事先排除）。用 8 个
+                    # 不同的错误密码：至少一个被判为 wrong，且都不会被判为 strong；全部碰巧
+                    # 通过的概率约 1e-17，测试不再偶发失败。
+                    verdicts = {core.check_zip_password(out, f"wrong-{i}") for i in range(8)}
+                    self.assertIn("wrong", verdicts)
+                    self.assertNotIn("strong", verdicts)
                 result, _, _ = self.extract(out, password=PASSWORD)
                 self.clear_dest()
 
